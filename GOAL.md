@@ -1,6 +1,6 @@
 # 最终目标与验收
 
-状态：进行中。用户已确认推进；第 3 步 WAL 文件写入与启动回放已实现并验证。等待讨论和明确 OK 后，再开始第 4 步 SSTable 格式与读写。
+状态：进行中。第 4 步独立 SSTable 文件读写已实现并验证；Store 仍使用 WAL + MemTable。等待讨论和明确 OK 后，再开始第 5 步刷盘和文件集合管理。
 
 ## 必须完成的两部分
 
@@ -15,7 +15,8 @@
 - [x] 内存中的 Put/Get/Delete 语义与验证，见 [第 1 步记录](docs/steps/01-memtable.md)。
 - [x] WAL 记录格式与编解码：完整记录、数据不足、格式与校验错误，见 [第 2 步记录](docs/steps/02-wal-record.md)。
 - [x] WAL 持久化写入、重启回放与文件损坏处理策略，见 [第 3 步记录](docs/steps/03-persistent-store.md)。已验证进程强杀与部分写入故障；未进行真实断电实验。
-- [ ] SSTable 读写、刷盘及重启后文件发现。
+- [x] 独立 SSTable 读写、删除标记与文件校验，见 [第 4 步记录](docs/steps/04-sstable.md)。
+- [ ] MemTable 刷盘、持久化文件集合、重启后文件发现及安全 WAL 回收。
 - [ ] 多层数据读取与删除标记处理。
 - [ ] 后台 compaction 及并发正确性验证。
 - [ ] Bloom filter 及无假阴性的验证。

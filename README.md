@@ -2,7 +2,7 @@
 
 一个逐步实现、逐步讲解的 C++ 学习项目。先完成单机 LSM 存储引擎，再完成三节点 Raft 复制。两部分都是最终验收要求。
 
-当前完成 **第 3 步：WAL 文件写入与启动回放**。Store 先追加并同步 WAL，再更新内存表；重新启动会按顺序回放日志恢复数据。主程序支持 `put/get/delete` 命令。当前按单线程、单个 WAL 所有者使用，尚未实现 SSTable。
+当前完成 **第 4 步：独立 SSTable 文件读写**。可以写出按 key 排序、包含值或删除标记的文件，打开时完整校验，再顺序点查。SSTable 尚未接入 Store；Store 仍先追加并同步 WAL，再更新内存表，启动时回放日志。主程序的 `put/get/delete` 用法不变。当前按单线程使用。
 
 ## 从哪里看
 
@@ -12,6 +12,7 @@
 - [第 1 步讲解](docs/steps/01-memtable.md)：内存表接口、实现、C++ 语法与验证结果。
 - [第 2 步讲解](docs/steps/02-wal-record.md)：WAL 字节格式、校验、解码状态与 C++ 写法。
 - [第 3 步讲解](docs/steps/03-persistent-store.md)：持久化顺序、启动回放、尾部恢复、文件资源与测试。
+- [第 4 步讲解](docs/steps/04-sstable.md)：SSTable 文件格式、删除标记、查询结果、读写流程与测试。
 - `include/kvstore/memtable.h`：MemTable 的声明。
 - `src/memtable.cpp`：MemTable 的实现。
 - `src/main.cpp`：命令行入口。
@@ -22,6 +23,9 @@
 - `include/kvstore/store.h`：持久化 Store 接口及恢复模式。
 - `src/store.cpp`：文件生命周期、日志写入同步和回放。
 - `tests/store_test.cpp`：持久化、恢复和写入故障测试。
+- `include/kvstore/sstable.h`：SSTable 条目、写文件和查询接口。
+- `src/sstable.cpp`：独立文件读写、格式校验和顺序查询。
+- `tests/sstable_test.cpp`：有序文件、删除标记、损坏与截断测试。
 - `CMakeLists.txt`：构建入口。
 
 现在不预建 Raft、gRPC 或缓存模块；到对应步骤再引入文件和依赖。后续代码只在这个子文件夹中开发。
@@ -94,6 +98,16 @@ c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_reco
 
 成功时输出 `All 12 Store tests passed.`。测试在独立临时目录中创建 WAL，结束时清理；强杀和文件大小限制只用于测试子进程。
 
+#### 编译并运行 SSTable 测试
+
+```sh
+mkdir -p build
+c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/wal_record.cpp src/sstable.cpp tests/sstable_test.cpp -o build/sstable_test
+./build/sstable_test
+```
+
+成功时输出 `All 12 SSTable tests passed.`。测试创建并清理自己的临时 `.sst` 文件，不使用手动运行 main 时的 WAL。SSTable 条目复用 WAL 编解码器，所以这里需要编译 `src/wal_record.cpp`。
+
 #### 这些编译参数是什么意思
 
 | 参数或文件 | 作用 |
@@ -101,7 +115,7 @@ c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_reco
 | `-std=c++17` | 使用 C++17 标准，支持 `std::optional` |
 | `-Wall -Wextra -Wpedantic` | 开启常用编译警告，帮助发现问题 |
 | `-I include` | 从项目的 `include/` 目录搜索头文件，因此能找到 `kvstore/memtable.h` |
-| `src/memtable.cpp` / `src/wal_record.cpp` / `src/store.cpp` | 提供内存表、编解码和持久化实现，按要构建的程序选择 |
+| `src/memtable.cpp` / `src/wal_record.cpp` / `src/store.cpp` / `src/sstable.cpp` | 提供内存表、编解码、持久化和 SSTable 实现，按要构建的程序选择 |
 | `tests/*_test.cpp` / `src/main.cpp` | 各自是独立程序入口，一次选其中一个 |
 | `-o build/...` | 指定生成的可执行文件位置 |
 
@@ -142,6 +156,15 @@ cmake --build build --target store_test
 ./build/store_test
 ```
 
+运行本次新增的 SSTable 测试：
+
+```sh
+cmake --build build --target sstable_test
+./build/sstable_test
+```
+
+成功输出 `All 12 SSTable tests passed.`。本步只增加独立模块和测试，没有新增 main 命令；Store 自动刷盘到 SSTable 留到第 5 步。
+
 构建并运行项目程序：
 
 ```sh
@@ -161,7 +184,7 @@ Put 输出 `OK`，下一次启动的 Get 输出 `Alice`。也可以执行：
 
 依次输出 `OK`、`Bob`、`deleted`、`<not found>`。当前 CLI 的 Get 未找到时退出码为 1；Delete 未找到仍正常完成，退出码为 0。非法参数返回 2，存储错误返回 1。这些命令使用的 WAL 会留在 `build/` 下，后续运行会继续使用它。
 
-这些可执行文件路径适用于当前 macOS 环境下的常规单配置构建。CMake 会从 `CMakeLists.txt` 读取头文件目录、C++ 标准和源文件依赖，构建时不需要手写 `-I` 和源文件列表。若要统一验证，可运行 `cmake --build build` 构建全部目标，再运行 `(cd build && ctest --output-on-failure)` 执行三组测试。
+这些可执行文件路径适用于当前 macOS 环境下的常规单配置构建。CMake 会从 `CMakeLists.txt` 读取头文件目录、C++ 标准和源文件依赖，构建时不需要手写 `-I` 和源文件列表。若要统一验证，可运行 `cmake --build build` 构建全部目标，再运行 `(cd build && ctest --output-on-failure)` 执行四组测试。
 
 ### 不完整尾部与损坏处理
 
@@ -179,9 +202,11 @@ Put 输出 `OK`，下一次启动的 Get 输出 `Alice`。也可以执行：
 
 ### 当前验证状态
 
-使用本机 CMake 4.4.4 和 Apple Clang 21 构建成功，CTest 登记的三组测试均通过：8 个 MemTable、12 个 WAL 记录、12 个 Store 测试函数，共 32 个。Store 测试包括正常重开、连续大记录回放、严格恢复保留文件、显式截尾后追加、损坏拒绝、文件所有权互斥、进程 SIGKILL 恢复和真实部分写入失败后的停止服务。
+使用本机 CMake 4.4.4 和 Apple Clang 21 构建成功，CTest 登记的四组测试均通过：8 个 MemTable、12 个 WAL 记录、12 个 Store、12 个 SSTable 测试函数，共 44 个。Store 测试包括正常重开、连续大记录回放、严格恢复保留文件、显式截尾后追加、损坏拒绝、文件所有权互斥、进程 SIGKILL 恢复和真实部分写入失败后的停止服务。SSTable 测试包括三种查询结果、最大 payload、独立字节样本、所有截断前缀、损坏和多余字节、排序验证及拒绝覆盖已有文件。
 
-启用编译警告、AddressSanitizer 和 UndefinedBehaviorSanitizer 的独立构建也通过这三组测试，无编译警告或检查错误报告；CLI 跨进程读写、删除、截尾恢复与退出码已另行验证。
+启用编译警告、AddressSanitizer 和 UndefinedBehaviorSanitizer 的独立构建也通过这四组测试，无编译警告或检查错误报告；第 3 步已另行验证 CLI 跨进程读写、删除、截尾恢复与退出码。
+
+SSTable writer 当前只写入并关闭新文件，不调用文件/目录同步，也不发布 Store 的文件集合；写入失败可能留下不完整文件。它不提供断电安全的刷盘承诺，读取方不会修复文件。第 5 步再实现同步、发布、恢复和安全 WAL 回收。
 
 所有编译输出均放在已忽略的 `build/` 目录中。
 
