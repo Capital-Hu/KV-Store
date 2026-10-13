@@ -4,6 +4,7 @@
 
 #include <cerrno>
 #include <csignal>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -23,6 +24,7 @@ namespace kvstore {
 struct StoreTestAccess {
     using Stage = Store::CompactStage;
     static void Hook(Store& store, std::function<void(Stage)> callback) {
+        std::lock_guard<std::mutex> lock(store.mutex_);
         store.compact_hook_ = std::move(callback);
     }
 };
@@ -291,7 +293,8 @@ void TestKilledCompactionAtEveryStage() {
                         if (stage == Stage::OldTableRemoved) { ++removed; }
                         const bool selected_removal = index == 7 ? removed == 2 : removed == 1;
                         if (stage == stages[index] && (stage != Stage::OldTableRemoved || selected_removal)) {
-                            ::kill(::getpid(), SIGKILL); ::_exit(3);
+                            ::kill(::getpid(), SIGKILL);
+                            for (;;) { ::pause(); }
                         }
                     });
                     store.Compact();
@@ -300,7 +303,8 @@ void TestKilledCompactionAtEveryStage() {
             }
             Child child(pid);
             const auto status = child.Wait();
-            Check(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "Child must reach selected boundary");
+            Check(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+                  "Child must reach boundary " + std::to_string(index) + "; status=" + std::to_string(status));
             Check(Metadata(base).sstable_ids.size() == (index >= 3 ? 1U : 2U), "Visible manifest selects complete old or new file set");
             const auto removed_count = index < 6 ? 0U : index == 6 ? 1U : 2U;
             for (std::size_t i = 0; i < old.sstable_ids.size(); ++i) {
@@ -427,6 +431,60 @@ void TestMixedModelAcrossFlushCompactAndReopen() {
     for (const auto& entry : expected) { Check(reopened.Get(entry.first) == entry.second, "Final reopen matches model"); }
 }
 
+void TestKilledCompactionWithConcurrentFlush() {
+    for (std::size_t index = 0; index < 7; ++index) {
+        TestDirectory directory;
+        const auto base = directory.Base();
+        Seed(base, false);
+        const auto original = Metadata(base);
+        const auto pid = ::fork();
+        Check(pid != -1, "Fork concurrent flush recovery test");
+        if (pid == 0) {
+            try {
+                kvstore::Store store(base, kvstore::WalRecoveryMode::Strict, 0, 0);
+                std::mutex gate_mutex;
+                std::condition_variable gate;
+                bool entered = false, released = false;
+                kvstore::StoreTestAccess::Hook(store, [&](Stage stage) {
+                    if (stage == Stage::SSTableWritten) {
+                        std::unique_lock<std::mutex> lock(gate_mutex);
+                        entered = true; gate.notify_all();
+                        gate.wait(lock, [&] { return released; });
+                    }
+                    if (stage == stages[index]) {
+                        ::kill(::getpid(), SIGKILL);
+                        for (;;) { ::pause(); }
+                    }
+                });
+                store.RequestCompaction();
+                {
+                    std::unique_lock<std::mutex> lock(gate_mutex);
+                    Check(gate.wait_for(lock, std::chrono::seconds(5), [&] { return entered; }), "Pause background merge");
+                }
+                store.Put("name", "concurrent"); store.Delete("keep"); store.Put("new-table", "saved"); store.Flush();
+                store.Put("pending-new-wal", "saved");
+                {
+                    std::lock_guard<std::mutex> lock(gate_mutex);
+                    released = true; gate.notify_all();
+                }
+                store.WaitForBackgroundWork();
+                ::_exit(4);
+            } catch (...) { ::_exit(2); }
+        }
+        Child child(pid);
+        const auto status = child.Wait();
+        Check(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "Concurrent child reaches kill boundary");
+        const auto published = Metadata(base);
+        Check(published.wal_id == original.next_file_id + 2, "Merge cannot restore the superseded WAL");
+        Check(published.sstable_ids.size() == (index >= 3 ? 2U : 3U), "Both manifest versions retain foreground SSTable");
+        kvstore::Store reopened(base);
+        Check(reopened.Get("name") == "concurrent" && !reopened.Get("keep") &&
+              reopened.Get("new-table") == "saved" && reopened.Get("pending-new-wal") == "saved",
+              "Concurrent flush and pending WAL survive every compaction publication boundary");
+        reopened.Compact();
+    }
+}
+
 int main() {
     try {
         TestMergeLatestByInputOrder(); TestPartialMergePreservesTombstones(); TestFullMergeDropsOnlyLatestDeletions();
@@ -434,7 +492,8 @@ int main() {
         TestPendingMemoryAndWalRemain(); TestNoTablesAndTombstoneOnlyOutput(); TestStableLockAndRepeatedCompaction();
         TestDamagedInputCannotPublish(); TestKilledCompactionAtEveryStage(); TestExceptionsStopStoreAndRecover();
         TestRealPartialOutputAndMetadataWrites(); TestPendingWalTailAfterCompaction(); TestMixedModelAcrossFlushCompactAndReopen();
-        std::cout << "All 15 compaction tests passed.\n";
+        TestKilledCompactionWithConcurrentFlush();
+        std::cout << "All 16 compaction tests passed.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Compaction test failed: " << error.what() << '\n';

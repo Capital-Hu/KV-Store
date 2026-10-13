@@ -1,6 +1,5 @@
 #include "kvstore/store.h"
 #include "kvstore/wal_record.h"
-#include "kvstore/compaction.h"
 #include "file_io.h"
 
 #include <cerrno>
@@ -50,8 +49,10 @@ std::size_t EntryBytes(const std::string& key, const std::optional<std::string>&
 
 }  // namespace
 
-Store::Store(const std::string& wal_path, WalRecoveryMode recovery, std::size_t flush_threshold_bytes)
-    : base_path_(wal_path), flush_threshold_bytes_(flush_threshold_bytes) {
+Store::Store(const std::string& wal_path, WalRecoveryMode recovery, std::size_t flush_threshold_bytes,
+             std::size_t compaction_threshold_tables)
+    : base_path_(wal_path), flush_threshold_bytes_(flush_threshold_bytes),
+      compaction_threshold_tables_(compaction_threshold_tables) {
     if (wal_path.empty() || wal_path.find('\0') != std::string::npos) {
         throw std::invalid_argument("WAL path must be nonempty and contain no null bytes");
     }
@@ -88,6 +89,7 @@ Store::Store(const std::string& wal_path, WalRecoveryMode recovery, std::size_t 
         }
         // Validate every live file first; only then remove unpublished/obsolete files.
         CleanupObsoleteFiles();
+        worker_ = std::thread(&Store::BackgroundLoop, this);
     } catch (...) {
         if (fd_ != -1) { ::close(fd_); fd_ = -1; }
         if (lock_fd_ != -1) { ::close(lock_fd_); lock_fd_ = -1; }
@@ -96,6 +98,13 @@ Store::Store(const std::string& wal_path, WalRecoveryMode recovery, std::size_t 
 }
 
 Store::~Store() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+        work_ready_.notify_one();
+    }
+    // Join without holding mutex_: the worker needs it to finish queued jobs.
+    if (worker_.joinable()) { worker_.join(); }
     if (fd_ != -1) { ::close(fd_); }
     if (lock_fd_ != -1) { ::close(lock_fd_); }
 }
@@ -113,7 +122,7 @@ void Store::Notify(FlushStage stage) {
 }
 
 void Store::Notify(CompactStage stage) {
-    if (compact_hook_) { compact_hook_(stage); }
+    if (active_compact_hook_) { active_compact_hook_(stage); }
 }
 
 void Store::PublishManifest(const Manifest& manifest, bool for_compaction) {
@@ -219,7 +228,14 @@ void Store::Replay(WalRecoveryMode recovery) {
 }
 
 void Store::EnsureUsable() const {
+    if (background_error_) { std::rethrow_exception(background_error_); }
     if (!usable_) { throw std::logic_error("Store is unusable after a write failure; close and reopen it"); }
+}
+
+void Store::FailLocked() {
+    usable_ = false;
+    work_ready_.notify_one();
+    work_done_.notify_all();
 }
 
 void Store::AppendAndSync(std::string_view bytes) {
@@ -228,10 +244,11 @@ void Store::AppendAndSync(std::string_view bytes) {
 }
 
 void Store::MaybeFlush() {
-    if (flush_threshold_bytes_ != 0 && table_bytes_ >= flush_threshold_bytes_) { Flush(); }
+    if (flush_threshold_bytes_ != 0 && table_bytes_ >= flush_threshold_bytes_) { FlushLocked(); }
 }
 
 void Store::Put(const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lock(mutex_);
     EnsureUsable();
     const auto bytes = EncodeWalRecord({WalRecordType::Put, key, value});
     try {
@@ -239,13 +256,18 @@ void Store::Put(const std::string& key, const std::string& value) {
         ApplyToMemTable(key, value);
         MaybeFlush();
     } catch (...) {
-        usable_ = false;
+        FailLocked();
         throw;
     }
 }
 
 std::optional<std::string> Store::Get(const std::string& key) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     EnsureUsable();
+    return GetLocked(key);
+}
+
+std::optional<std::string> Store::GetLocked(const std::string& key) const {
     const auto memory = table_.Lookup(key);
     if (memory) { return memory->value; }  // Includes tombstones: stop, do not search older files.
     for (auto it = sstables_.rbegin(); it != sstables_.rend(); ++it) {
@@ -259,22 +281,28 @@ std::optional<std::string> Store::Get(const std::string& key) const {
 }
 
 bool Store::Delete(const std::string& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
     EnsureUsable();
     const auto bytes = EncodeWalRecord({WalRecordType::Delete, key, ""});
-    const bool existed = Get(key).has_value();  // Check the complete view, not only the MemTable.
+    const bool existed = GetLocked(key).has_value();  // Check the complete view, not only the MemTable.
     try {
         AppendAndSync(bytes);
         ApplyToMemTable(key, std::nullopt);
         MaybeFlush();
         return existed;
     } catch (...) {
-        usable_ = false;
+        FailLocked();
         throw;
     }
 }
 
 void Store::Flush() {
+    std::lock_guard<std::mutex> lock(mutex_);
     EnsureUsable();
+    FlushLocked();
+}
+
+void Store::FlushLocked() {
     const auto snapshot = table_.Snapshot();
     if (snapshot.empty()) { return; }
     if (manifest_.next_file_id > std::numeric_limits<std::uint64_t>::max() - 2) {
@@ -319,50 +347,24 @@ void Store::Flush() {
         detail::RemoveFile(old_wal_path);
         Notify(FlushStage::OldWalRemoved);
         detail::SyncParentDirectory(base_path_);
+        if (compaction_threshold_tables_ != 0 &&
+            manifest_.sstable_ids.size() >= compaction_threshold_tables_) {
+            ScheduleCompactionLocked();
+        }
     } catch (...) {
-        usable_ = false;
+        FailLocked();
         throw;
     }
 }
 
-void Store::Compact() {
-    EnsureUsable();
-    if (manifest_.sstable_ids.empty()) { return; }
-    if (manifest_.next_file_id == std::numeric_limits<std::uint64_t>::max()) {
-        throw std::length_error("Store file IDs exhausted");
-    }
-    const auto old_ids = manifest_.sstable_ids;
-    const auto output_path = SSTablePath(manifest_.next_file_id);
-    std::vector<std::string> inputs;
-    inputs.reserve(old_ids.size());
-    for (const auto id : old_ids) { inputs.push_back(SSTablePath(id)); }
-    Manifest next = manifest_;
-    next.sstable_ids = {next.next_file_id++};
-    EncodeManifest(next);
-    std::vector<std::unique_ptr<SSTableReader>> replacement;
-    replacement.reserve(1);
-    try {
-        // Every current SSTable participates. Pending memory/WAL are newer and untouched.
-        MergeSSTables(inputs, output_path, true);
-        Notify(CompactStage::SSTableWritten);
-        detail::SyncFile(output_path);
-        detail::SyncParentDirectory(base_path_);
-        Notify(CompactStage::SSTableSynced);
-        replacement.push_back(std::make_unique<SSTableReader>(output_path));
-        PublishManifest(next, true);
-        manifest_ = std::move(next);
-        sstables_.swap(replacement);
-        replacement.clear();  // Close old readers before reclaiming their files.
-        Notify(CompactStage::ReadersSwitched);
-        for (const auto id : old_ids) {
-            detail::RemoveFile(SSTablePath(id));
-            Notify(CompactStage::OldTableRemoved);
-        }
-        detail::SyncParentDirectory(base_path_);
-    } catch (...) {
-        usable_ = false;
-        throw;
-    }
+std::size_t Store::sstable_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return manifest_.sstable_ids.size();
+}
+
+std::size_t Store::memtable_bytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_bytes_;
 }
 
 }  // namespace kvstore

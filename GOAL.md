@@ -1,6 +1,6 @@
 # 最终目标与验收
 
-状态：进行中。第 6 步同步 compaction 已完成：全量流式合并 SSTable、清理旧版本及安全范围内的删除标记，同步发布清单后回收旧文件。等待讨论和明确 OK 后，再开始第 7 步后台刷盘和 compaction。
+状态：进行中。第 7a 步后台 compaction 和 Store 并发访问已完成：合并期间允许前台读写/同步刷盘，发布时保留新增 SSTable 和当前 WAL。第 7b 步后台刷盘尚未开始，等待讨论和明确 OK。
 
 ## 必须完成的两部分
 
@@ -20,7 +20,8 @@
 - [x] MemTable 同步刷盘、持久化文件集合、重启后文件发现及安全 WAL 回收，见 [第 5 步记录](docs/steps/05-store-flush.md)。
 - [x] 多层数据读取与删除标记处理，已验证更新覆盖、删除不复活及删除后重插。
 - [x] 同步全量 compaction、流式读写、删除标记规则、发布和回收中断验证，见 [第 6 步记录](docs/steps/06-compaction.md)。
-- [ ] 后台 compaction 及并发正确性验证。
+- [x] 后台 compaction 及并发正确性验证，见 [第 7a 步记录](docs/steps/07a-background-compaction.md)。
+- [ ] 后台刷盘：冻结 MemTable、多 WAL 恢复与资源上限（第 7b 步）。
 - [ ] Bloom filter 及无假阴性的验证。
 - [ ] 有容量限制的 block cache 及淘汰行为验证。
 - [ ] 单机故障恢复集成验证。
