@@ -1,4 +1,5 @@
 #include "kvstore/sstable.h"
+#include "kvstore/memtable.h"
 #include "kvstore/wal_record.h"
 
 #include <cstdlib>
@@ -268,6 +269,35 @@ void TestExistingFileAndInvalidPaths() {
     CheckValue(reader, "name", "Alice");
 }
 
+void TestMemTableSnapshotToSSTable() {
+    TestDirectory directory;
+    kvstore::MemTable table;
+    table.Put("name", "Alice");
+    table.Put("city", "Vancouver");
+    table.Put("empty", "");
+    table.Put("name", "Bob");
+    table.Delete("city");
+    table.Delete("missing");
+    std::vector<kvstore::SSTableEntry> entries;
+    for (const auto& entry : table.Snapshot()) {
+        const auto type = entry.value.has_value() ? SSTableEntryType::Value : SSTableEntryType::Tombstone;
+        entries.push_back({type, entry.key, entry.value.value_or("")});
+    }
+    // Manual conversion exercises the export contract, not a durable Store flush.
+    kvstore::WriteSSTable(directory.File(), entries);
+    kvstore::SSTableReader reader(directory.File());
+    Check(reader.size() == 4, "Export must preserve values and both kinds of deletion");
+    CheckValue(reader, "name", "Bob");
+    CheckValue(reader, "empty", "");
+    for (const auto& key : {"city", "missing"}) {
+        const auto result = reader.Get(key);
+        Check(result.has_value() && result->type == SSTableEntryType::Tombstone,
+              "Deleted keys must remain tombstones in the SSTable");
+    }
+    Check(!reader.Get("never-mentioned").has_value(), "Unmentioned key must remain absent from the file");
+    Check(table.Get("name") == "Bob", "Export and file writing must not clear the MemTable");
+}
+
 int main() {
     try {
         TestSortedLookupAndRepeatedReads();
@@ -282,7 +312,8 @@ int main() {
         TestCorruptionAndTrailingBytes();
         TestInvalidOrderingOnDisk();
         TestExistingFileAndInvalidPaths();
-        std::cout << "All 12 SSTable tests passed.\n";
+        TestMemTableSnapshotToSSTable();
+        std::cout << "All 13 SSTable tests passed.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "SSTable test failed: " << error.what() << '\n';

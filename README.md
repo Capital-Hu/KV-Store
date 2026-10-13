@@ -2,7 +2,7 @@
 
 一个逐步实现、逐步讲解的 C++ 学习项目。先完成单机 LSM 存储引擎，再完成三节点 Raft 复制。两部分都是最终验收要求。
 
-当前完成 **第 4 步：独立 SSTable 文件读写**。可以写出按 key 排序、包含值或删除标记的文件，打开时完整校验，再顺序点查。SSTable 尚未接入 Store；Store 仍先追加并同步 WAL，再更新内存表，启动时回放日志。主程序的 `put/get/delete` 用法不变。当前按单线程使用。
+当前完成 **第 5a 步：MemTable 删除标记和有序导出**。MemTable 现在保留删除标记，并能导出独立的有序副本；测试验证副本可转换并写成 SSTable。第 5 步的文件集合、Store 刷盘、WAL 轮换和回收尚未实现。Store 仍先追加并同步 WAL，再更新内存表，启动时回放日志。主程序的 `put/get/delete` 用法不变，当前按单线程使用。
 
 ## 从哪里看
 
@@ -13,6 +13,7 @@
 - [第 2 步讲解](docs/steps/02-wal-record.md)：WAL 字节格式、校验、解码状态与 C++ 写法。
 - [第 3 步讲解](docs/steps/03-persistent-store.md)：持久化顺序、启动回放、尾部恢复、文件资源与测试。
 - [第 4 步讲解](docs/steps/04-sstable.md)：SSTable 文件格式、删除标记、查询结果、读写流程与测试。
+- [第 5a 步讲解](docs/steps/05a-memtable-export.md)：内存删除标记、Get/Lookup 的区别、有序导出和 SSTable 转换测试。
 - `include/kvstore/memtable.h`：MemTable 的声明。
 - `src/memtable.cpp`：MemTable 的实现。
 - `src/main.cpp`：命令行入口。
@@ -55,7 +56,7 @@ c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp tests/memtab
 成功时输出：
 
 ```text
-All 8 MemTable tests passed.
+All 12 MemTable tests passed.
 ```
 
 如果测试失败，会打印失败原因并返回非零退出码。编译失败时先处理编译错误，不继续运行旧的可执行文件。
@@ -102,11 +103,11 @@ c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_reco
 
 ```sh
 mkdir -p build
-c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/wal_record.cpp src/sstable.cpp tests/sstable_test.cpp -o build/sstable_test
+c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp tests/sstable_test.cpp -o build/sstable_test
 ./build/sstable_test
 ```
 
-成功时输出 `All 12 SSTable tests passed.`。测试创建并清理自己的临时 `.sst` 文件，不使用手动运行 main 时的 WAL。SSTable 条目复用 WAL 编解码器，所以这里需要编译 `src/wal_record.cpp`。
+成功时输出 `All 13 SSTable tests passed.`。测试创建并清理自己的临时 `.sst` 文件，不使用手动运行 main 时的 WAL。SSTable 条目复用 WAL 编解码器，所以这里需要编译 `src/wal_record.cpp`；第 5a 步新增了 MemTable 导出转 SSTable 测试，因此也需要 `src/memtable.cpp`。
 
 #### 这些编译参数是什么意思
 
@@ -156,14 +157,14 @@ cmake --build build --target store_test
 ./build/store_test
 ```
 
-运行本次新增的 SSTable 测试：
+运行 SSTable 测试：
 
 ```sh
 cmake --build build --target sstable_test
 ./build/sstable_test
 ```
 
-成功输出 `All 12 SSTable tests passed.`。本步只增加独立模块和测试，没有新增 main 命令；Store 自动刷盘到 SSTable 留到第 5 步。
+成功输出 `All 13 SSTable tests passed.`。第 5a 步的 4 个新内存测试在 `memtable_test` 中，1 个导出转 SSTable 的测试在 `sstable_test` 中；没有新增 main 命令或测试目标，Store 自动刷盘在后续小步接入。
 
 构建并运行项目程序：
 
@@ -202,7 +203,7 @@ Put 输出 `OK`，下一次启动的 Get 输出 `Alice`。也可以执行：
 
 ### 当前验证状态
 
-使用本机 CMake 4.4.4 和 Apple Clang 21 构建成功，CTest 登记的四组测试均通过：8 个 MemTable、12 个 WAL 记录、12 个 Store、12 个 SSTable 测试函数，共 44 个。Store 测试包括正常重开、连续大记录回放、严格恢复保留文件、显式截尾后追加、损坏拒绝、文件所有权互斥、进程 SIGKILL 恢复和真实部分写入失败后的停止服务。SSTable 测试包括三种查询结果、最大 payload、独立字节样本、所有截断前缀、损坏和多余字节、排序验证及拒绝覆盖已有文件。
+使用本机 CMake 4.4.4 和 Apple Clang 21 构建成功，CTest 登记的四组测试均通过：12 个 MemTable、12 个 WAL 记录、12 个 Store、13 个 SSTable 测试函数，共 49 个。Store 测试包括正常重开、连续大记录回放、严格恢复保留文件、显式截尾后追加、损坏拒绝、文件所有权互斥、进程 SIGKILL 恢复和真实部分写入失败后的停止服务。SSTable 测试包括三种查询结果、最大 payload、独立字节样本、所有截断前缀、损坏和多余字节、排序验证及拒绝覆盖已有文件。第 5a 步增加了内存标记状态、有序导出的所有权和清空行为，以及导出转 SSTable 的测试。
 
 启用编译警告、AddressSanitizer 和 UndefinedBehaviorSanitizer 的独立构建也通过这四组测试，无编译警告或检查错误报告；第 3 步已另行验证 CLI 跨进程读写、删除、截尾恢复与退出码。
 
