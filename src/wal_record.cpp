@@ -1,4 +1,5 @@
 #include "kvstore/wal_record.h"
+#include "coding.h"
 
 #include <stdexcept>
 
@@ -9,39 +10,9 @@ constexpr std::string_view kMagic = "KVW1";
 constexpr std::size_t kHeaderSize = 13;
 constexpr std::size_t kChecksumSize = 4;
 
-void AppendU32(std::string& bytes, std::uint32_t value) {
-    // Split a 32-bit integer into 4 bytes, least significant first (little-endian).
-    // For value = 4, append 04 00 00 00, not the character '4'.
-    for (int shift = 0; shift < 32; shift += 8) {
-        bytes.push_back(static_cast<char>((value >> shift) & 0xffU));
-    }
-}
-
-// Caller checks that the input contains these four bytes.
-std::uint32_t ReadU32(std::string_view bytes, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (int shift = 0; shift < 32; shift += 8) {
-        const auto byte = static_cast<unsigned char>(bytes[offset++]);
-        value |= static_cast<std::uint32_t>(byte) << shift;
-    }
-    return value;
-}
-
-// CRC-32 (IEEE), reflected polynomial; see RFC 1952, section 8.
-std::uint32_t Crc32(std::string_view bytes) {
-    std::uint32_t crc = 0xffffffffU;
-    for (unsigned char byte : bytes) {
-        crc ^= byte;
-        for (int bit = 0; bit < 8; ++bit) {
-            if ((crc & 1U) != 0) {
-                crc = (crc >> 1) ^ 0xedb88320U;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    return crc ^ 0xffffffffU;
-}
+using detail::AppendU32;
+using detail::ReadU32;
+using detail::Crc32;
 
 }  // namespace
 

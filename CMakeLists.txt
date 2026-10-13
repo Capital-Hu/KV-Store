@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 project(replicated_kv_store LANGUAGES CXX)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(kvstore_engine STATIC src/memtable.cpp src/wal_record.cpp src/store.cpp src/sstable.cpp)
+add_library(kvstore_engine STATIC src/memtable.cpp src/wal_record.cpp src/store.cpp src/sstable.cpp
+    src/manifest.cpp src/file_io.cpp)
 target_include_directories(kvstore_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(kvstore_engine PUBLIC cxx_std_17)
 
@@ -27,4 +28,13 @@ if(BUILD_TESTING)
     add_executable(sstable_test tests/sstable_test.cpp)
     target_link_libraries(sstable_test PRIVATE kvstore_engine)
     add_test(NAME sstable COMMAND sstable_test)
+
+    add_executable(manifest_test tests/manifest_test.cpp)
+    target_link_libraries(manifest_test PRIVATE kvstore_engine)
+    add_test(NAME manifest COMMAND manifest_test)
+
+    add_executable(store_flush_test tests/store_flush_test.cpp)
+    target_link_libraries(store_flush_test PRIVATE kvstore_engine)
+    add_test(NAME store_flush COMMAND store_flush_test)
+    set_tests_properties(store_flush PROPERTIES TIMEOUT 60)
 endif()

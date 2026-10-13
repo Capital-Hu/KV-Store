@@ -1,5 +1,6 @@
 #include "kvstore/sstable.h"
 #include "kvstore/wal_record.h"
+#include "coding.h"
 
 #include <cerrno>
 #include <filesystem>
@@ -30,20 +31,8 @@ void ThrowSystemError(const char* action) {
     throw std::system_error(error, std::generic_category(), action);
 }
 
-void AppendU32(std::string& bytes, std::uint32_t value) {
-    for (int shift = 0; shift < 32; shift += 8) {
-        bytes.push_back(static_cast<char>((value >> shift) & 0xffU));
-    }
-}
-
-// The caller must first check that these four bytes exist.
-std::uint32_t ReadU32(std::string_view bytes, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (int shift = 0; shift < 32; shift += 8) {
-        value |= static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[offset++])) << shift;
-    }
-    return value;
-}
+using detail::AppendU32;
+using detail::ReadU32;
 
 // O_EXCL makes the no-overwrite rule part of file creation itself.
 class NewFile {
