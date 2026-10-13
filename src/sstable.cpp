@@ -1,6 +1,7 @@
 #include "kvstore/sstable.h"
 #include "kvstore/wal_record.h"
 #include "coding.h"
+#include "file_io.h"
 
 #include <cerrno>
 #include <filesystem>
@@ -26,59 +27,8 @@ void ValidatePath(const std::string& path) {
     }
 }
 
-void ThrowSystemError(const char* action) {
-    const int error = errno;
-    throw std::system_error(error, std::generic_category(), action);
-}
-
 using detail::AppendU32;
 using detail::ReadU32;
-
-// O_EXCL makes the no-overwrite rule part of file creation itself.
-class NewFile {
-public:
-    explicit NewFile(const std::string& path) {
-        fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-        if (fd_ == -1) {
-            ThrowSystemError("Create SSTable");
-        }
-    }
-    ~NewFile() {
-        if (fd_ != -1) {
-            ::close(fd_);
-        }
-    }
-    NewFile(const NewFile&) = delete;
-    NewFile& operator=(const NewFile&) = delete;
-
-    void Write(std::string_view bytes) {
-        std::size_t written = 0;
-        while (written < bytes.size()) {
-            const auto count = ::write(fd_, bytes.data() + written, bytes.size() - written);
-            if (count == -1) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                ThrowSystemError("Write SSTable");
-            }
-            if (count == 0) {
-                throw std::runtime_error("SSTable write made no progress");
-            }
-            written += static_cast<std::size_t>(count);
-        }
-    }
-
-    void Close() {
-        const int fd = fd_;
-        fd_ = -1;
-        if (::close(fd) == -1) {
-            ThrowSystemError("Close SSTable");
-        }
-    }
-
-private:
-    int fd_ = -1;
-};
 
 void ReadExact(std::istream& input, char* buffer, std::size_t size) {
     input.read(buffer, static_cast<std::streamsize>(size));
@@ -134,16 +84,69 @@ void WriteSSTable(const std::string& path, const std::vector<SSTableEntry>& entr
             throw std::invalid_argument("SSTable keys must be strictly increasing");
         }
     }
-    NewFile output(path);
-    std::string header(kMagic);
-    AppendU32(header, static_cast<std::uint32_t>(entries.size()));
-    output.Write(header);
-    for (const auto& entry : entries) {
-        const auto type = entry.type == SSTableEntryType::Value
-                              ? WalRecordType::Put : WalRecordType::Delete;
-        output.Write(EncodeWalRecord({type, entry.key, entry.value}));
+    SSTableWriter writer(path);
+    for (const auto& entry : entries) { writer.Append(entry); }
+    writer.Finish();
+}
+
+SSTableWriter::SSTableWriter(const std::string& path) {
+    ValidatePath(path);
+    fd_ = detail::OpenRegular(path, O_WRONLY | O_CREAT | O_EXCL);
+    try {
+        std::string header(kMagic);
+        AppendU32(header, 0);  // The final count is unknown until the streaming merge ends.
+        detail::WriteAll(fd_, header);
+    } catch (...) {
+        ::close(fd_);
+        fd_ = -1;
+        throw;
     }
-    output.Close();
+}
+
+SSTableWriter::~SSTableWriter() {
+    if (fd_ != -1) { ::close(fd_); }
+}
+
+void SSTableWriter::EnsureWritable() const {
+    if (fd_ == -1 || !usable_) { throw std::logic_error("SSTable writer is finished or unusable"); }
+}
+
+void SSTableWriter::Append(const SSTableEntry& entry) {
+    EnsureWritable();
+    ValidateEntry(entry);
+    if (previous_key_ && !(*previous_key_ < entry.key)) {
+        throw std::invalid_argument("SSTable keys must be strictly increasing");
+    }
+    if (entry_count_ == std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("Too many SSTable entries");
+    }
+    const auto type = entry.type == SSTableEntryType::Value ? WalRecordType::Put : WalRecordType::Delete;
+    const auto bytes = EncodeWalRecord({type, entry.key, entry.value});
+    auto next_key = entry.key;  // Allocate before writing; committing this key uses a move.
+    try {
+        detail::WriteAll(fd_, bytes);
+        previous_key_ = std::move(next_key);
+        ++entry_count_;
+    } catch (...) {
+        usable_ = false;
+        throw;
+    }
+}
+
+void SSTableWriter::Finish() {
+    EnsureWritable();
+    try {
+        std::string count;
+        AppendU32(count, entry_count_);
+        if (::lseek(fd_, 4, SEEK_SET) == -1) { detail::ThrowSystemError("Seek SSTable count"); }
+        detail::WriteAll(fd_, count);  // Patch only the four count bytes, not any entries.
+        const int fd = fd_;
+        fd_ = -1;
+        if (::close(fd) == -1) { detail::ThrowSystemError("Close SSTable"); }
+    } catch (...) {
+        usable_ = false;
+        throw;
+    }
 }
 
 SSTableReader::SSTableReader(const std::string& path) {
@@ -174,22 +177,28 @@ SSTableReader::SSTableReader(const std::string& path) {
     if (input_.peek() != std::char_traits<char>::eof() || input_.bad()) {
         throw std::runtime_error("Unexpected SSTable trailing bytes or read failure");
     }
+    Rewind();
+}
+
+void SSTableReader::Rewind() {
+    input_.clear();
+    input_.seekg(static_cast<std::streamoff>(kTableHeaderSize));
+    if (!input_) { throw std::runtime_error("Cannot seek SSTable"); }
+    entries_read_ = 0;
+}
+
+std::optional<SSTableEntry> SSTableReader::Next() {
+    if (entries_read_ >= entry_count_) { return std::nullopt; }
+    auto entry = ReadEntry(input_);
+    ++entries_read_;
+    return entry;
 }
 
 std::optional<SSTableEntry> SSTableReader::Get(const std::string& key) {
-    input_.clear();  // Clear EOF from validation or a previous lookup.
-    input_.seekg(static_cast<std::streamoff>(kTableHeaderSize));
-    if (!input_) {
-        throw std::runtime_error("Cannot seek SSTable");
-    }
-    for (std::uint32_t i = 0; i < entry_count_; ++i) {
-        auto entry = ReadEntry(input_);
-        if (entry.key == key) {
-            return entry;
-        }
-        if (key < entry.key) {
-            break;  // Sorted keys mean the target cannot appear later.
-        }
+    Rewind();
+    while (auto entry = Next()) {
+        if (entry->key == key) { return entry; }
+        if (key < entry->key) { break; }
     }
     return std::nullopt;
 }

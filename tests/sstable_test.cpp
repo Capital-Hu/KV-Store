@@ -298,6 +298,72 @@ void TestMemTableSnapshotToSSTable() {
     Check(table.Get("name") == "Bob", "Export and file writing must not clear the MemTable");
 }
 
+void TestStreamingWriterAndCursor() {
+    TestDirectory directory;
+    {
+        kvstore::SSTableWriter writer(directory.File());
+        writer.Append({SSTableEntryType::Value, "", ""});
+        writer.Append({SSTableEntryType::Tombstone, "deleted", ""});
+        writer.Append({SSTableEntryType::Value, "name", "Alice"});
+        Check(writer.size() == 3, "Streaming writer must count appended entries");
+        writer.Finish();
+        CheckThrows([&] { writer.Append({SSTableEntryType::Value, "z", "late"}); }, "Finished writer rejects appends");
+        CheckThrows([&] { writer.Finish(); }, "Finished writer rejects a second Finish");
+    }
+    kvstore::SSTableReader reader(directory.File());
+    const auto first = reader.Next();
+    Check(first && first->key.empty() && first->type == SSTableEntryType::Value, "New reader starts at first entry");
+    Check(reader.Next()->type == SSTableEntryType::Tombstone, "Cursor must preserve tombstone");
+    Check(reader.Next()->value == "Alice", "Cursor advances through sorted entries");
+    Check(!reader.Next() && !reader.Next(), "Exhausted cursor remains at end");
+    reader.Rewind();
+    Check(reader.Next()->key.empty() && first->value.empty(), "Rewind restarts; earlier returned entry still owns bytes");
+    CheckValue(reader, "name", "Alice");
+    Check(!reader.Next(), "Get also advances the shared cursor");
+}
+
+void TestStreamingValidationCanContinue() {
+    TestDirectory directory;
+    kvstore::SSTableWriter writer(directory.File());
+    writer.Append({SSTableEntryType::Value, "b", "first"});
+    const auto before = std::filesystem::file_size(directory.File());
+    CheckThrows([&] { writer.Append({SSTableEntryType::Value, "a", "wrong order"}); }, "Streaming writer rejects descending key");
+    CheckThrows([&] { writer.Append({SSTableEntryType::Tombstone, "b", ""}); }, "Streaming writer rejects duplicate key");
+    CheckThrows([&] { writer.Append({SSTableEntryType::Tombstone, "c", "invalid"}); }, "Streaming writer validates entry type/value");
+    Check(std::filesystem::file_size(directory.File()) == before && writer.size() == 1,
+          "Rejected input must not append bytes or change the count");
+    writer.Append({SSTableEntryType::Value, "c", "last"});
+    writer.Finish();
+    kvstore::SSTableReader reader(directory.File());
+    Check(reader.size() == 2, "Writer stays usable after validation errors");
+    CheckValue(reader, "c", "last");
+}
+
+void TestUnfinishedWriterNotPublished() {
+    TestDirectory directory;
+    {
+        kvstore::SSTableWriter writer(directory.File());
+        writer.Append({SSTableEntryType::Value, "name", "Alice"});
+        // Deliberately omit Finish, leaving an unpublished zero-count header.
+    }
+    CheckThrows([&] { kvstore::SSTableReader reader(directory.File()); }, "Unfinished populated output must be rejected");
+    const auto bytes = ReadBytes(directory.File());
+    Check(bytes.substr(4, 4) == std::string(4, '\0'), "Destructor must not silently finish a partial operation");
+}
+
+void TestStreamingEmptyFileAndIndependentReaders() {
+    TestDirectory directory;
+    { kvstore::SSTableWriter writer(directory.File()); writer.Finish(); }
+    kvstore::SSTableReader empty(directory.File());
+    Check(empty.size() == 0 && !empty.Next(), "Streaming writer can finish an empty table");
+    kvstore::WriteSSTable(directory.File("two.sst"), {
+        {SSTableEntryType::Value, "a", "first"}, {SSTableEntryType::Value, "b", "second"},
+    });
+    kvstore::SSTableReader first(directory.File("two.sst")), second(directory.File("two.sst"));
+    Check(first.Next()->key == "a" && first.Next()->key == "b", "First cursor advances independently");
+    Check(second.Next()->key == "a", "Second reader retains its own cursor");
+}
+
 int main() {
     try {
         TestSortedLookupAndRepeatedReads();
@@ -313,7 +379,11 @@ int main() {
         TestInvalidOrderingOnDisk();
         TestExistingFileAndInvalidPaths();
         TestMemTableSnapshotToSSTable();
-        std::cout << "All 13 SSTable tests passed.\n";
+        TestStreamingWriterAndCursor();
+        TestStreamingValidationCanContinue();
+        TestUnfinishedWriterNotPublished();
+        TestStreamingEmptyFileAndIndependentReaders();
+        std::cout << "All 17 SSTable tests passed.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "SSTable test failed: " << error.what() << '\n';

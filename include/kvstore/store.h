@@ -43,6 +43,9 @@ public:
     // Synchronously publish pending entries as a new SSTable and rotate the WAL.
     // No pending entries means no work. Threshold 0 disables automatic flushing.
     void Flush();
+    // Merge all current SSTables synchronously. Pending MemTable/WAL stay unchanged.
+    // Full coverage and the absence of snapshots allow obsolete tombstones to be dropped.
+    void Compact();
     std::size_t sstable_count() const { return manifest_.sstable_ids.size(); }
     // Encoded entry sizes, including tombstones; not allocator or map-node memory.
     std::size_t memtable_bytes() const { return table_bytes_; }
@@ -56,8 +59,13 @@ private:
         SSTableWritten, SSTableSynced, WalSynced, ManifestTempSynced,
         ManifestRenamed, ManifestDurable, WalSwitched, OldWalRemoved,
     };
+    enum class CompactStage {
+        SSTableWritten, SSTableSynced, ManifestTempSynced, ManifestRenamed,
+        ManifestDurable, ReadersSwitched, OldTableRemoved,
+    };
     void Notify(FlushStage stage);
-    void PublishManifest(const Manifest& manifest);
+    void Notify(CompactStage stage);
+    void PublishManifest(const Manifest& manifest, bool for_compaction = false);
     void CleanupObsoleteFiles();
     void ApplyToMemTable(const std::string& key, const std::optional<std::string>& value);
     void MaybeFlush();
@@ -76,6 +84,7 @@ private:
     std::size_t table_bytes_ = 0;
     std::size_t flush_threshold_bytes_;
     std::function<void(FlushStage)> flush_hook_;
+    std::function<void(CompactStage)> compact_hook_;
     bool usable_ = true;
     std::size_t truncated_tail_bytes_ = 0;
 };

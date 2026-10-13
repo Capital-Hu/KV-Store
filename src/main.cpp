@@ -10,13 +10,14 @@ int main(int argc, char* argv[]) {
                      "       kvstore <wal-path> get <key>\n"
                      "       kvstore <wal-path> delete <key>\n"
                      "       kvstore <wal-path> flush\n"
+                     "       kvstore <wal-path> compact\n"
                      "       kvstore <wal-path> recover-tail\n";
         return 2;
     }
     const std::string command = argv[2];
     if (!((command == "put" && argc == 5) ||
           ((command == "get" || command == "delete") && argc == 4) ||
-          ((command == "recover-tail" || command == "flush") && argc == 3))) {
+          ((command == "recover-tail" || command == "flush" || command == "compact") && argc == 3))) {
         std::cerr << "Invalid command or argument count.\n";
         return 2;
     }
@@ -39,6 +40,9 @@ int main(int argc, char* argv[]) {
             std::cout << (store.Delete(argv[3]) ? "deleted\n" : "<not found>\n");
         } else if (command == "flush") {
             store.Flush();
+            std::cout << "OK (" << store.sstable_count() << " SSTables)\n";
+        } else if (command == "compact") {
+            store.Compact();
             std::cout << "OK (" << store.sstable_count() << " SSTables)\n";
         } else {
             std::cout << "Truncated " << store.truncated_tail_bytes() << " incomplete tail bytes.\n";

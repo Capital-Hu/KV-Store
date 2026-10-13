@@ -1,5 +1,6 @@
 #include "kvstore/store.h"
 #include "kvstore/wal_record.h"
+#include "kvstore/compaction.h"
 #include "file_io.h"
 
 #include <cerrno>
@@ -111,7 +112,11 @@ void Store::Notify(FlushStage stage) {
     if (flush_hook_) { flush_hook_(stage); }
 }
 
-void Store::PublishManifest(const Manifest& manifest) {
+void Store::Notify(CompactStage stage) {
+    if (compact_hook_) { compact_hook_(stage); }
+}
+
+void Store::PublishManifest(const Manifest& manifest, bool for_compaction) {
     const auto bytes = EncodeManifest(manifest);
     const auto path = base_path_ + ".manifest";
     const auto temporary = path + ".tmp";
@@ -120,12 +125,15 @@ void Store::PublishManifest(const Manifest& manifest) {
         detail::WriteAll(fd.get(), bytes);
         detail::SyncFile(fd.get());
     }
-    Notify(FlushStage::ManifestTempSynced);
+    if (for_compaction) { Notify(CompactStage::ManifestTempSynced); }
+    else { Notify(FlushStage::ManifestTempSynced); }
     if (::rename(temporary.c_str(), path.c_str()) == -1) { detail::ThrowSystemError("Publish manifest"); }
-    Notify(FlushStage::ManifestRenamed);
+    if (for_compaction) { Notify(CompactStage::ManifestRenamed); }
+    else { Notify(FlushStage::ManifestRenamed); }
     // rename changes visibility atomically; directory synchronization makes it durable.
     detail::SyncParentDirectory(path);
-    Notify(FlushStage::ManifestDurable);
+    if (for_compaction) { Notify(CompactStage::ManifestDurable); }
+    else { Notify(FlushStage::ManifestDurable); }
 }
 
 void Store::CleanupObsoleteFiles() {
@@ -310,6 +318,46 @@ void Store::Flush() {
         Notify(FlushStage::WalSwitched);
         detail::RemoveFile(old_wal_path);
         Notify(FlushStage::OldWalRemoved);
+        detail::SyncParentDirectory(base_path_);
+    } catch (...) {
+        usable_ = false;
+        throw;
+    }
+}
+
+void Store::Compact() {
+    EnsureUsable();
+    if (manifest_.sstable_ids.empty()) { return; }
+    if (manifest_.next_file_id == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::length_error("Store file IDs exhausted");
+    }
+    const auto old_ids = manifest_.sstable_ids;
+    const auto output_path = SSTablePath(manifest_.next_file_id);
+    std::vector<std::string> inputs;
+    inputs.reserve(old_ids.size());
+    for (const auto id : old_ids) { inputs.push_back(SSTablePath(id)); }
+    Manifest next = manifest_;
+    next.sstable_ids = {next.next_file_id++};
+    EncodeManifest(next);
+    std::vector<std::unique_ptr<SSTableReader>> replacement;
+    replacement.reserve(1);
+    try {
+        // Every current SSTable participates. Pending memory/WAL are newer and untouched.
+        MergeSSTables(inputs, output_path, true);
+        Notify(CompactStage::SSTableWritten);
+        detail::SyncFile(output_path);
+        detail::SyncParentDirectory(base_path_);
+        Notify(CompactStage::SSTableSynced);
+        replacement.push_back(std::make_unique<SSTableReader>(output_path));
+        PublishManifest(next, true);
+        manifest_ = std::move(next);
+        sstables_.swap(replacement);
+        replacement.clear();  // Close old readers before reclaiming their files.
+        Notify(CompactStage::ReadersSwitched);
+        for (const auto id : old_ids) {
+            detail::RemoveFile(SSTablePath(id));
+            Notify(CompactStage::OldTableRemoved);
+        }
         detail::SyncParentDirectory(base_path_);
     } catch (...) {
         usable_ = false;

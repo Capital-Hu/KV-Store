@@ -1,6 +1,6 @@
 # 最终目标与验收
 
-状态：进行中。第 5 步已完成：Store 同步刷盘、持久化文件清单、多文件查询、启动恢复、WAL 轮换和安全回收已实现并验证。等待讨论和明确 OK 后，再开始第 6 步同步 compaction。
+状态：进行中。第 6 步同步 compaction 已完成：全量流式合并 SSTable、清理旧版本及安全范围内的删除标记，同步发布清单后回收旧文件。等待讨论和明确 OK 后，再开始第 7 步后台刷盘和 compaction。
 
 ## 必须完成的两部分
 
@@ -19,6 +19,7 @@
 - [x] MemTable 保留删除标记、区分三种状态并导出有序副本，验证可转换并写出 SSTable，见 [第 5a 步记录](docs/steps/05a-memtable-export.md)。
 - [x] MemTable 同步刷盘、持久化文件集合、重启后文件发现及安全 WAL 回收，见 [第 5 步记录](docs/steps/05-store-flush.md)。
 - [x] 多层数据读取与删除标记处理，已验证更新覆盖、删除不复活及删除后重插。
+- [x] 同步全量 compaction、流式读写、删除标记规则、发布和回收中断验证，见 [第 6 步记录](docs/steps/06-compaction.md)。
 - [ ] 后台 compaction 及并发正确性验证。
 - [ ] Bloom filter 及无假阴性的验证。
 - [ ] 有容量限制的 block cache 及淘汰行为验证。

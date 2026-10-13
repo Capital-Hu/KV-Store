@@ -2,7 +2,7 @@
 
 一个逐步实现、逐步讲解的 C++ 学习项目。先完成单机 LSM 存储引擎，再完成三节点 Raft 复制。两部分都是最终验收要求。
 
-当前完成 **第 5 步：Store 刷盘、文件集合和 WAL 回收**。写入先同步当前 WAL，再更新 MemTable；可以手动 flush，也会在待刷盘数据达到默认 4 MiB 阈值时同步刷盘。读取先查 MemTable，再从新到旧查询 SSTable；启动依据 manifest 恢复有效文件集合，安全回收旧 WAL 和未发布文件。当前按单线程使用，尚未实现 compaction、后台线程或查询索引。
+当前完成 **第 6 步：同步 compaction**。`compact` 会流式合并全部 SSTable，保留每个 key 的最新磁盘状态，安全清理删除历史，发布清单后回收旧文件。MemTable 和当前 WAL 保持不变。原来的 WAL 持久化、手动/阈值刷盘、多文件查询与恢复流程继续使用；当前按单线程运行，尚未引入后台线程或查询索引。
 
 ## 从哪里看
 
@@ -15,6 +15,7 @@
 - [第 4 步讲解](docs/steps/04-sstable.md)：SSTable 文件格式、删除标记、查询结果、读写流程与测试。
 - [第 5a 步讲解](docs/steps/05a-memtable-export.md)：内存删除标记、Get/Lookup 的区别、有序导出和 SSTable 转换测试。
 - [第 5 步讲解](docs/steps/05-store-flush.md)：文件清单、同步发布、读写与恢复、WAL 轮换回收和中断测试。
+- [第 6 步讲解](docs/steps/06-compaction.md)：流式有序合并、删除标记规则、SSTable 游标/逐条写入、同步发布与回收。
 - `include/kvstore/memtable.h`：MemTable 的声明。
 - `src/memtable.cpp`：MemTable 的实现。
 - `src/main.cpp`：命令行入口。
@@ -32,6 +33,8 @@
 - `src/file_io.h`、`src/file_io.cpp`：共享文件 I/O、同步和锁。
 - `src/coding.h`：共享小端整数和 CRC 编码辅助函数，原 WAL/SSTable 格式不变。
 - `tests/manifest_test.cpp`、`tests/store_flush_test.cpp`：清单与刷盘恢复测试。
+- `include/kvstore/compaction.h`、`src/compaction.cpp`：按输入新旧顺序逐条合并 SSTable。
+- `tests/compaction_test.cpp`：合并、pending 状态保持、故障恢复与模型测试。
 - `CMakeLists.txt`：构建入口。
 
 现在不预建 Raft、gRPC 或缓存模块；到对应步骤再引入文件和依赖。后续代码只在这个子文件夹中开发。
@@ -70,7 +73,7 @@ All 12 MemTable tests passed.
 
 ```sh
 mkdir -p build
-c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/manifest.cpp src/file_io.cpp src/store.cpp src/main.cpp -o build/kvstore
+c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp src/main.cpp -o build/kvstore
 ./build/kvstore build/demo.wal put name Alice
 ./build/kvstore build/demo.wal get name
 ```
@@ -98,7 +101,7 @@ c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/wal_record.cpp tests/wal_
 
 ```sh
 mkdir -p build
-c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/manifest.cpp src/file_io.cpp src/store.cpp tests/store_test.cpp -o build/store_test
+c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp tests/store_test.cpp -o build/store_test
 ./build/store_test
 ```
 
@@ -108,11 +111,11 @@ c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_reco
 
 ```sh
 mkdir -p build
-c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp tests/sstable_test.cpp -o build/sstable_test
+c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/file_io.cpp tests/sstable_test.cpp -o build/sstable_test
 ./build/sstable_test
 ```
 
-成功时输出 `All 13 SSTable tests passed.`。测试创建并清理自己的临时 `.sst` 文件，不使用手动运行 main 时的 WAL。SSTable 条目复用 WAL 编解码器，所以这里需要编译 `src/wal_record.cpp`；第 5a 步新增了 MemTable 导出转 SSTable 测试，因此也需要 `src/memtable.cpp`。
+成功时输出 `All 17 SSTable tests passed.`。测试创建并清理自己的临时 `.sst` 文件，不使用手动运行 main 时的 WAL。条目复用 WAL 编解码器，导出测试依赖 MemTable，streaming writer 复用 file_io，因此需要上述实现源文件。
 
 #### 编译并运行清单和 Store 刷盘测试
 
@@ -120,11 +123,21 @@ c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_reco
 mkdir -p build
 c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/manifest.cpp tests/manifest_test.cpp -o build/manifest_test
 ./build/manifest_test
-c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/manifest.cpp src/file_io.cpp src/store.cpp tests/store_flush_test.cpp -o build/store_flush_test
+c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp tests/store_flush_test.cpp -o build/store_flush_test
 ./build/store_flush_test
 ```
 
 分别输出 `All 5 manifest tests passed.` 和 `All 17 Store flush tests passed.`。刷盘测试只使用独立临时目录，文件大小限制和强杀只作用于测试子进程。
+
+#### 编译并运行 compaction 测试
+
+```sh
+mkdir -p build
+c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp tests/compaction_test.cpp -o build/compaction_test
+./build/compaction_test
+```
+
+成功时输出 `All 15 compaction tests passed.`。测试文件和故障子进程都独立于手动使用的 Store。
 
 #### 这些编译参数是什么意思
 
@@ -133,7 +146,7 @@ c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_reco
 | `-std=c++17` | 使用 C++17 标准，支持 `std::optional` |
 | `-Wall -Wextra -Wpedantic` | 开启常用编译警告，帮助发现问题 |
 | `-I include` | 从项目的 `include/` 目录搜索头文件，因此能找到 `kvstore/memtable.h` |
-| `src/*.cpp` 中对应的实现文件 | 提供各模块的定义，按程序依赖选择；当前 Store 依赖 MemTable、WAL、SSTable、manifest 和 file_io，推荐用 CMake 管理 |
+| `src/*.cpp` 中对应的实现文件 | 提供各模块的定义，按程序依赖选择；当前 Store 依赖 MemTable、WAL、SSTable、manifest、file_io 和 compaction，推荐用 CMake 管理 |
 | `tests/*_test.cpp` / `src/main.cpp` | 各自是独立程序入口，一次选其中一个 |
 | `-o build/...` | 指定生成的可执行文件位置 |
 
@@ -181,9 +194,9 @@ cmake --build build --target sstable_test
 ./build/sstable_test
 ```
 
-成功输出 `All 13 SSTable tests passed.`。
+成功输出 `All 17 SSTable tests passed.`。
 
-运行本次新增的清单和刷盘测试：
+运行清单和刷盘测试：
 
 ```sh
 cmake --build build --target manifest_test store_flush_test
@@ -192,6 +205,15 @@ cmake --build build --target manifest_test store_flush_test
 ```
 
 分别输出 `All 5 manifest tests passed.` 和 `All 17 Store flush tests passed.`。
+
+运行本次新增的 compaction 测试：
+
+```sh
+cmake --build build --target compaction_test
+./build/compaction_test
+```
+
+成功输出 `All 15 compaction tests passed.`。
 
 构建并运行项目程序：
 
@@ -221,7 +243,24 @@ flush 输出当前 SSTable 数量，Get 仍输出 `Alice`，此时从 SSTable �
 
 依次输出 `OK`、`Bob`、`deleted`、`<not found>`。Get 未找到时退出码为 1；Delete 未找到仍正常完成，退出码为 0。非法参数返回 2，存储错误返回 1。数据文件留在 `build/` 下，后续运行继续使用。删除标记会随刷盘进入 SSTable，避免旧值复活。
 
-这些可执行文件路径适用于当前 macOS 环境下的常规单配置构建。CMake 会从 `CMakeLists.txt` 读取头文件目录、C++ 标准和源文件依赖，构建时不需要手写 `-I` 和源文件列表。若要统一验证，可运行 `cmake --build build` 构建全部目标，再运行 `(cd build && ctest --output-on-failure)` 执行六组测试。
+这些可执行文件路径适用于当前 macOS 环境下的常规单配置构建。CMake 会从 `CMakeLists.txt` 读取头文件目录、C++ 标准和源文件依赖，构建时不需要手写 `-I` 和源文件列表。若要统一验证，可运行 `cmake --build build` 构建全部目标，再运行 `(cd build && ctest --output-on-failure)` 执行七组测试。
+
+### 合并 SSTable
+
+先用一个新的示例基础路径制造两个文件，再执行 compact：
+
+```sh
+./build/kvstore build/step6-demo.wal put name Alice
+./build/kvstore build/step6-demo.wal flush
+./build/kvstore build/step6-demo.wal put name Bob
+./build/kvstore build/step6-demo.wal flush
+./build/kvstore build/step6-demo.wal compact
+./build/kvstore build/step6-demo.wal get name
+```
+
+compact 输出 `OK (1 SSTables)`，Get 输出 `Bob`；旧 SSTable 在新结果及清单同步后回收。Compact 不调用 Flush，未刷盘的 MemTable 和当前 WAL 不变，仍优先于合并后的文件。仅合并一个文件时也会重写以清理删除标记；全删除结果保存为合法空表。
+
+独立 MergeSSTables 默认保留删除标记；Store 的 Compact 合并全部 SSTable 且当前没有历史快照，才允许清理它们。后续若做部分合并，必须继续遮住输入外的旧值。
 
 ### 不完整尾部与损坏处理
 
@@ -243,11 +282,11 @@ flush 输出当前 SSTable 数量，Get 仍输出 `Alice`，此时从 SSTable �
 
 ### 当前验证状态
 
-本机 CMake 4.4.4 和 Apple Clang 21 构建成功，六组 CTest 均通过，共 71 个测试函数：12 个 MemTable、12 个 WAL、12 个原 Store、13 个 SSTable、5 个 manifest、17 个 Store 刷盘测试。
+本机 CMake 4.4.4 和 Apple Clang 21 构建成功，七组 CTest 均通过，共 90 个测试函数：12 个 MemTable、12 个 WAL、12 个原 Store、17 个 SSTable、5 个 manifest、17 个 Store 刷盘、15 个 compaction 测试。
 
-新增测试涵盖新旧文件覆盖、删除不复活、阈值触发、旧日志退休、缺失/损坏拒绝、孤立文件清理、轮换后尾部恢复和稳定锁；在 8 个刷盘边界分别强杀首次/后续刷盘进程，注入异常，并制造真实的部分 SSTable/清单写入。启用编译警告、AddressSanitizer 和 UndefinedBehaviorSanitizer 的独立构建也通过六组测试，无编译警告或检查错误报告。另用 CLI 跨进程执行 90 次混合操作、穿插 flush 与查询，对照独立内存模型并验证旧 WAL 回收。
+已有测试覆盖刷盘和恢复边界。第 6 步增加有序多路合并、必要删除标记保留/全量安全清理、pending MemTable/WAL 不变、8 个发布/回收边界的强杀和异常、真实部分输出/清单写入，以及 96 次混合操作模型检查。启用编译警告、AddressSanitizer 和 UndefinedBehaviorSanitizer 的独立构建也通过七组测试，无编译警告或检查错误报告。另用 CLI 跨进程执行 90 次混合操作，穿插 flush、compact 和查询，对照模型并验证 WAL 不被 compact 改写、旧 SSTable 回收。
 
-独立的 WriteSSTable 仍只负责格式写出；Store::Flush 负责补齐同步、清单发布与回收协议。当前没有 compaction、后台并发、块索引、Bloom filter、block cache、Raft 或事务，不声称完成真实断电验证。
+独立 SSTable writer 和 MergeSSTables 只负责文件构建，Store 负责同步、清单发布与回收协议。当前没有后台并发、块索引、Bloom filter、block cache、Raft 或事务，不声称完成真实断电验证。合并仍扫描和校验全部输入，占用调用线程并临时增加输入 reader 数量。
 
 所有编译输出均放在已忽略的 `build/` 目录中。
 
