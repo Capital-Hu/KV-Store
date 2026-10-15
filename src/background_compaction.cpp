@@ -101,7 +101,7 @@ void Store::RunCompaction() {
     detail::SyncFile(output_path);
     detail::SyncParentDirectory(base_path_);
     Notify(CompactStage::SSTableSynced);
-    auto reader = std::make_unique<SSTableReader>(output_path);
+    auto reader = OpenSSTable(output_id);
 
     std::lock_guard<std::mutex> lock(mutex_);
     try {

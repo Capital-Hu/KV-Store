@@ -1,9 +1,11 @@
 #pragma once
 
 #include "kvstore/bloom_filter.h"
+#include "kvstore/block_cache.h"
 
 #include <cstdint>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -26,8 +28,24 @@ struct SSTableEntry {
 struct SSTableReadStats {
     std::uint64_t get_calls = 0;
     std::uint64_t bloom_negatives = 0;
-    std::uint64_t table_scans = 0;
-    std::uint64_t entries_examined = 0;
+    std::uint64_t table_scans = 0;  // Exact data lookups: one block when indexed, otherwise a full scan.
+    std::uint64_t entries_examined = 0;  // Lookup comparisons, separate from cold-block validation below.
+    std::uint64_t index_lookups = 0;
+    std::uint64_t block_reads = 0;
+    std::uint64_t block_bytes_read = 0;
+    std::uint64_t block_entries_validated = 0;
+    std::uint64_t cache_hits = 0;
+    std::uint64_t cache_misses = 0;
+};
+
+constexpr std::size_t kSSTableBlockBytes = 4096;
+constexpr std::size_t kMaxSSTableIndexBytes = 16 * 1024 * 1024;
+
+struct SSTableReadOptions {
+    bool use_bloom_filter = true;
+    bool use_block_index = true;
+    std::shared_ptr<BlockCache> block_cache;
+    std::size_t index_budget_bytes = kMaxSSTableIndexBytes;
 };
 
 // Write a new file; never overwrite an existing path.
@@ -65,10 +83,13 @@ private:
 
 // Single-threaded reader. The file must not be modified while it is open.
 // Opening validates the entire file and builds an in-memory filter, including tombstones.
-// A possible match still requires scanning; filters are rebuilt on every open.
+// Builds a sparse block index during validation. Get scans one candidate block.
+// Metadata is rebuilt on open; KVS1 bytes stay unchanged. Cache use is optional.
 class SSTableReader {
 public:
     explicit SSTableReader(const std::string& path, bool use_bloom_filter = true);
+    SSTableReader(const std::string& path, SSTableReadOptions options);
+    ~SSTableReader();
 
     SSTableReader(const SSTableReader&) = delete;
     SSTableReader& operator=(const SSTableReader&) = delete;
@@ -81,18 +102,36 @@ public:
     std::uint32_t size() const { return entry_count_; }
     const SSTableReadStats& read_stats() const { return read_stats_; }
     bool bloom_filter_enabled() const { return bloom_ && bloom_->enabled(); }
+    bool block_index_enabled() const { return index_enabled_; }
+    std::size_t block_count() const { return index_.size(); }
 
-    // A scanning Get rewinds/advances this cursor; a Bloom negative leaves it unchanged.
+    // An exact Get sets the logical cursor as a full scan would; Bloom negatives leave it unchanged.
     // Use separate readers for independent scans. Returned entries own their strings.
     void Rewind();
     std::optional<SSTableEntry> Next();
 
 private:
+    struct BlockIndexEntry {
+        std::string last_key;
+        std::uint64_t offset;
+        std::uint32_t bytes;
+        std::uint32_t first_entry;
+    };
+    std::shared_ptr<const std::string> ReadBlock(std::size_t block);
+    std::optional<SSTableEntry> GetIndexed(const std::string& key);
+    void Seek(std::uint64_t offset);
     std::ifstream input_;  // Owns and closes the file through RAII.
     std::uint32_t entry_count_ = 0;
     std::uint32_t entries_read_ = 0;
     std::optional<BloomFilter> bloom_;
     SSTableReadStats read_stats_;
+    std::vector<BlockIndexEntry> index_;
+    bool index_enabled_ = true;
+    std::uint64_t data_end_ = 8;
+    std::uint64_t next_offset_ = 8;
+    bool cursor_positioned_ = true;
+    std::shared_ptr<BlockCache> cache_;
+    std::uint64_t cache_table_id_ = 0;
 };
 
 }  // namespace kvstore

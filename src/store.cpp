@@ -62,8 +62,9 @@ void Apply(MemTable& table, std::size_t& bytes, const std::string& key,
 }  // namespace
 
 Store::Store(const std::string& wal_path, WalRecoveryMode recovery, std::size_t flush_threshold_bytes,
-             std::size_t compaction_threshold_tables)
-    : base_path_(wal_path), flush_threshold_bytes_(flush_threshold_bytes),
+             std::size_t compaction_threshold_tables, std::size_t block_cache_capacity_bytes)
+    : base_path_(wal_path), block_cache_(std::make_shared<BlockCache>(block_cache_capacity_bytes)),
+      flush_threshold_bytes_(flush_threshold_bytes),
       compaction_threshold_tables_(compaction_threshold_tables) {
     if (wal_path.empty() || wal_path.find('\0') != std::string::npos) {
         throw std::invalid_argument("WAL path must be nonempty and contain no null bytes");
@@ -85,7 +86,7 @@ Store::Store(const std::string& wal_path, WalRecoveryMode recovery, std::size_t 
             throw std::runtime_error("Manifest is missing but numbered store files exist");
         }
         for (const auto id : manifest_.sstable_ids) {
-            sstables_.push_back(std::make_unique<SSTableReader>(SSTablePath(id)));
+            sstables_.push_back(OpenSSTable(id));
         }
         if (manifest_.frozen_wal_id) {
             frozen_ = std::make_shared<FrozenTable>();
@@ -152,6 +153,12 @@ std::string Store::WalPath(std::uint64_t id) const {
 
 std::string Store::SSTablePath(std::uint64_t id) const {
     return base_path_ + ".sst." + std::to_string(id);
+}
+
+std::unique_ptr<SSTableReader> Store::OpenSSTable(std::uint64_t id) const {
+    SSTableReadOptions options;
+    options.block_cache = block_cache_;
+    return std::make_unique<SSTableReader>(SSTablePath(id), std::move(options));
 }
 
 void Store::Notify(FlushStage stage) {
@@ -358,6 +365,10 @@ std::size_t Store::memtable_bytes() const {
 std::size_t Store::frozen_memtable_bytes() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return frozen_ ? frozen_->bytes : 0;
+}
+
+BlockCacheStats Store::block_cache_stats() const {
+    return block_cache_->stats();
 }
 
 }  // namespace kvstore

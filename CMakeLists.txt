@@ -6,7 +6,7 @@ find_package(Threads REQUIRED)
 
 add_library(kvstore_engine STATIC src/memtable.cpp src/wal_record.cpp src/store.cpp src/sstable.cpp
     src/manifest.cpp src/file_io.cpp src/compaction.cpp src/background_compaction.cpp src/background_flush.cpp
-    src/bloom_filter.cpp)
+    src/bloom_filter.cpp src/block_cache.cpp)
 target_include_directories(kvstore_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(kvstore_engine PUBLIC cxx_std_17)
 target_link_libraries(kvstore_engine PUBLIC Threads::Threads)
@@ -65,4 +65,19 @@ if(BUILD_TESTING)
     target_link_libraries(sstable_bloom_test PRIVATE kvstore_engine)
     add_test(NAME sstable_bloom COMMAND sstable_bloom_test)
     set_tests_properties(sstable_bloom PROPERTIES TIMEOUT 60)
+
+    add_executable(block_cache_test tests/block_cache_test.cpp)
+    target_link_libraries(block_cache_test PRIVATE kvstore_engine)
+    add_test(NAME block_cache COMMAND block_cache_test)
+    set_tests_properties(block_cache PROPERTIES TIMEOUT 60)
+
+    add_executable(sstable_index_test tests/sstable_index_test.cpp)
+    target_link_libraries(sstable_index_test PRIVATE kvstore_engine)
+    add_test(NAME sstable_index COMMAND sstable_index_test)
+    set_tests_properties(sstable_index PROPERTIES TIMEOUT 60)
+
+    add_executable(engine_integration_test tests/engine_integration_test.cpp)
+    target_link_libraries(engine_integration_test PRIVATE kvstore_engine)
+    add_test(NAME engine_integration COMMAND engine_integration_test)
+    set_tests_properties(engine_integration PROPERTIES TIMEOUT 120)
 endif()

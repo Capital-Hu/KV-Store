@@ -1,6 +1,6 @@
 # 最终目标与验收
 
-状态：进行中。第 8 步 Bloom filter 已完成：SSTable 打开校验时构建内存过滤器，查询负判断跳过扫描，覆盖删除标记并验证无漏判、样本误判率及扫描量。过滤器暂不持久化，重开时重建。等待讨论和明确 OK 后，再开始第 9 步块索引与 block cache。
+状态：进行中。第 10 步单机集成与进程故障验证已完成：十四组 CTest、156 个测试函数通过，新增独立模型混合操作、四层读取与 38 个进程强杀恢复场景。完整内存检查及新增进程内线程检查通过。第一阶段的自动化验收已完成；仍需讨论架构和限制，用户明确 OK 后才开始第二阶段 Raft。整体目标尚未完成，真实断电和性能 benchmark 尚未验证。
 
 ## 必须完成的两部分
 
@@ -23,8 +23,8 @@
 - [x] 后台 compaction 及并发正确性验证，见 [第 7a 步记录](docs/steps/07a-background-compaction.md)。
 - [x] 后台刷盘：单冻结 MemTable 槽、双 WAL 恢复及自动阈值下的写入背压，见 [第 7b 步记录](docs/steps/07b-background-flush.md)。阈值不是精确堆内存上限；关闭自动阈值后由调用方控制可写表大小。
 - [x] Bloom filter 及无假阴性验证，见 [第 8 步记录](docs/steps/08-bloom-filter.md)。每次打开 SSTable 在内存重建；已测固定样本误判率和逻辑扫描量，没有物理 I/O 或延迟性能结论。
-- [ ] 有容量限制的 block cache 及淘汰行为验证。
-- [ ] 单机故障恢复集成验证。
+- [x] 内存块索引、每 Store 共享且按字节计费的 LRU block cache、淘汰/禁用/旧 reader 清理与查询正确性验证，见 [第 9 步记录](docs/steps/09-block-index-cache.md)。缓存预算不含容器元数据或外部持有的已淘汰块；索引重开重建。
+- [x] 单机故障恢复集成验证，见 [第 10 步记录](docs/steps/10-engine-integration.md) 及 [单机架构说明](docs/architecture.md)。覆盖独立模型混合操作、四层查询、缓存开关与 38 个进程强杀场景；未进行真实断电实验。
 - [ ] Raft 选举、日志复制、持久化、状态机应用与 gRPC 通信。
 - [ ] 三节点 leader failover 和节点 crash recovery 验证。
 - [ ] 可重复的混合负载 benchmark：吞吐量、P50/P95/P99 延迟、运行环境和参数。

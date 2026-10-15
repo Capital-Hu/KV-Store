@@ -89,7 +89,12 @@ void TestEnabledDisabledEquivalenceAndScanCounts() {
     TestDirectory directory;
     kvstore::WriteSSTable(directory.File(), Entries(128));
     const auto original = Read(directory.File());
-    kvstore::SSTableReader filtered(directory.File()), baseline(directory.File(), false);
+    // Isolate Bloom filtering from the separately tested block-index optimization.
+    kvstore::SSTableReadOptions options;
+    options.use_block_index = false;
+    kvstore::SSTableReader filtered(directory.File(), options);
+    options.use_bloom_filter = false;
+    kvstore::SSTableReader baseline(directory.File(), options);
     Check(filtered.bloom_filter_enabled() && !baseline.bloom_filter_enabled(), "Reader can disable filtering for comparison");
     Check(filtered.read_stats().entries_examined == 0, "Opening validation is not counted as query work");
     for (int i = 0; i < 128; ++i) {
@@ -117,7 +122,9 @@ void TestEnabledDisabledEquivalenceAndScanCounts() {
 void TestFalsePositiveStillUsesExactLookup() {
     TestDirectory directory;
     kvstore::WriteSSTable(directory.File(), Entries(32));
-    kvstore::SSTableReader reader(directory.File());
+    kvstore::SSTableReadOptions options;
+    options.use_block_index = false;
+    kvstore::SSTableReader reader(directory.File(), options);
     bool observed = false;
     for (int i = 0; i < 5000; ++i) {
         const auto before = reader.read_stats().table_scans;

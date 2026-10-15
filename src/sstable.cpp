@@ -3,6 +3,7 @@
 #include "coding.h"
 #include "file_io.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <filesystem>
 #include <limits>
@@ -37,7 +38,7 @@ void ReadExact(std::istream& input, char* buffer, std::size_t size) {
     }
 }
 
-SSTableEntry ReadEntry(std::istream& input) {
+SSTableEntry ReadEntry(std::istream& input, std::size_t* encoded_size = nullptr) {
     std::string bytes(kRecordHeaderSize, '\0');
     ReadExact(input, bytes.data(), bytes.size());
     // Validate type and lengths BEFORE using them to allocate a payload buffer.
@@ -51,6 +52,7 @@ SSTableEntry ReadEntry(std::istream& input) {
     if (decoded.status != WalDecodeStatus::Ok) {
         throw std::runtime_error("Corrupt SSTable entry");
     }
+    if (encoded_size) { *encoded_size = bytes.size(); }
     auto& record = decoded.record.value();
     const auto type = record.type == WalRecordType::Put
                           ? SSTableEntryType::Value : SSTableEntryType::Tombstone;
@@ -149,7 +151,11 @@ void SSTableWriter::Finish() {
     }
 }
 
-SSTableReader::SSTableReader(const std::string& path, bool use_bloom_filter) {
+SSTableReader::SSTableReader(const std::string& path, bool use_bloom_filter)
+    : SSTableReader(path, SSTableReadOptions{use_bloom_filter, true, {}, kMaxSSTableIndexBytes}) {}
+
+SSTableReader::SSTableReader(const std::string& path, SSTableReadOptions options)
+    : index_enabled_(options.use_block_index), cache_(std::move(options.block_cache)) {
     ValidatePath(path);
     if (!std::filesystem::is_regular_file(path)) {
         throw std::invalid_argument("SSTable must be an existing regular file");
@@ -164,37 +170,154 @@ SSTableReader::SSTableReader(const std::string& path, bool use_bloom_filter) {
         throw std::runtime_error("Invalid SSTable format/version");
     }
     entry_count_ = ReadU32(header, 4);
-    if (use_bloom_filter) { bloom_.emplace(entry_count_); }
+    if (options.use_bloom_filter) { bloom_.emplace(entry_count_); }
     std::string previous_key;
+    std::uint64_t offset = kTableHeaderSize, block_offset = offset;
+    std::uint32_t block_bytes = 0, first_entry = 0;
+    std::size_t index_bytes = 0;
+    const auto add_index = [&] {
+        if (!index_enabled_ || block_bytes == 0) { return; }
+        const auto charge = sizeof(BlockIndexEntry) + previous_key.size();
+        if (charge > options.index_budget_bytes || index_bytes > options.index_budget_bytes - charge) {
+            // Drop partial metadata and retain the original exact scan as a safe fallback.
+            index_enabled_ = false;
+            std::vector<BlockIndexEntry>().swap(index_);
+            return;
+        }
+        index_.push_back({previous_key, block_offset, block_bytes, first_entry});
+        index_bytes += charge;
+    };
     for (std::uint32_t i = 0; i < entry_count_; ++i) {
-        auto entry = ReadEntry(input_);
+        std::size_t encoded_size = 0;
+        auto entry = ReadEntry(input_, &encoded_size);
         if (i > 0 && !(previous_key < entry.key)) {
             throw std::runtime_error("SSTable keys are not strictly increasing");
         }
         // A tombstone is present in this table and must never be filtered out.
         if (bloom_) { bloom_->Add(entry.key); }
+        if (index_enabled_) {
+            if (block_bytes != 0 && block_bytes + encoded_size > kSSTableBlockBytes) {
+                add_index();
+                block_offset = offset;
+                block_bytes = 0;
+                first_entry = i;
+            }
+            block_bytes += static_cast<std::uint32_t>(encoded_size);
+        }
+        offset += encoded_size;
         previous_key = std::move(entry.key);
     }
+    add_index();
+    data_end_ = offset;
     // The count catches even truncation exactly between two complete records.
     // EOF checking also rejects extra records or garbage after the declared entries.
     if (input_.peek() != std::char_traits<char>::eof() || input_.bad()) {
         throw std::runtime_error("Unexpected SSTable trailing bytes or read failure");
     }
     Rewind();
+    if (cache_ && index_enabled_ && !index_.empty()) { cache_table_id_ = cache_->NewTableId(); }
+}
+
+SSTableReader::~SSTableReader() {
+    if (cache_ && cache_table_id_ != 0) { cache_->EraseTable(cache_table_id_); }
+}
+
+void SSTableReader::Seek(std::uint64_t offset) {
+    if (offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+        throw std::runtime_error("SSTable offset exceeds stream limits");
+    }
+    input_.clear();
+    input_.seekg(static_cast<std::streamoff>(offset));
+    if (!input_) { throw std::runtime_error("Cannot seek SSTable"); }
 }
 
 void SSTableReader::Rewind() {
-    input_.clear();
-    input_.seekg(static_cast<std::streamoff>(kTableHeaderSize));
-    if (!input_) { throw std::runtime_error("Cannot seek SSTable"); }
+    Seek(kTableHeaderSize);
     entries_read_ = 0;
+    next_offset_ = kTableHeaderSize;
+    cursor_positioned_ = true;
 }
 
 std::optional<SSTableEntry> SSTableReader::Next() {
     if (entries_read_ >= entry_count_) { return std::nullopt; }
-    auto entry = ReadEntry(input_);
+    if (!cursor_positioned_) { Seek(next_offset_); cursor_positioned_ = true; }
+    std::size_t encoded_size = 0;
+    auto entry = ReadEntry(input_, &encoded_size);
+    next_offset_ += encoded_size;
     ++entries_read_;
     return entry;
+}
+
+std::shared_ptr<const std::string> SSTableReader::ReadBlock(std::size_t block) {
+    const auto& meta = index_[block];
+    const BlockCacheKey key{cache_table_id_, meta.offset};
+    if (cache_) {
+        auto cached = cache_->Lookup(key);
+        if (cached) { ++read_stats_.cache_hits; return cached; }
+        ++read_stats_.cache_misses;
+    }
+    cursor_positioned_ = false;
+    Seek(meta.offset);
+    std::string bytes(meta.bytes, '\0');
+    ++read_stats_.block_reads;
+    ReadExact(input_, bytes.data(), bytes.size());
+    read_stats_.block_bytes_read += bytes.size();
+    // Validate the entire block before admitting it, even if Get wants its first record.
+    std::size_t consumed = 0;
+    std::uint32_t count = 0;
+    std::string previous;
+    while (consumed < bytes.size()) {
+        auto decoded = DecodeWalRecord(std::string_view(bytes).substr(consumed));
+        if (decoded.status != WalDecodeStatus::Ok ||
+            (count != 0 && !(previous < decoded.record->key))) {
+            throw std::runtime_error("Corrupt or unsorted SSTable block");
+        }
+        consumed += decoded.bytes_consumed;
+        previous = std::move(decoded.record->key);
+        ++count;
+        ++read_stats_.block_entries_validated;
+    }
+    const auto end_entry = block + 1 < index_.size() ? index_[block + 1].first_entry : entry_count_;
+    if (count != end_entry - meta.first_entry || previous != meta.last_key) {
+        throw std::runtime_error("SSTable block disagrees with validated index");
+    }
+    auto result = std::make_shared<const std::string>(std::move(bytes));
+    if (cache_) { cache_->Insert(key, result); }
+    return result;
+}
+
+std::optional<SSTableEntry> SSTableReader::GetIndexed(const std::string& key) {
+    ++read_stats_.index_lookups;
+    const auto found = std::lower_bound(index_.begin(), index_.end(), key,
+        [](const BlockIndexEntry& block, const std::string& searched) { return block.last_key < searched; });
+    if (found == index_.end()) {
+        entries_read_ = entry_count_;
+        next_offset_ = data_end_;
+        cursor_positioned_ = false;
+        return std::nullopt;
+    }
+    ++read_stats_.table_scans;
+    const auto bytes = ReadBlock(static_cast<std::size_t>(found - index_.begin()));
+    std::size_t consumed = 0;
+    auto ordinal = found->first_entry;
+    while (consumed < bytes->size()) {
+        auto decoded = DecodeWalRecord(std::string_view(*bytes).substr(consumed));
+        if (decoded.status != WalDecodeStatus::Ok) { throw std::runtime_error("Corrupt cached SSTable block"); }
+        consumed += decoded.bytes_consumed;
+        ++ordinal;
+        ++read_stats_.entries_examined;
+        // Preserve Get/Next cursor behavior even when a cache hit did not touch input_.
+        entries_read_ = ordinal;
+        next_offset_ = found->offset + consumed;
+        cursor_positioned_ = false;
+        auto& record = *decoded.record;
+        if (record.key == key) {
+            return SSTableEntry{record.type == WalRecordType::Put ? SSTableEntryType::Value : SSTableEntryType::Tombstone,
+                                std::move(record.key), std::move(record.value)};
+        }
+        if (key < record.key) { return std::nullopt; }
+    }
+    return std::nullopt;
 }
 
 std::optional<SSTableEntry> SSTableReader::Get(const std::string& key) {
@@ -203,6 +326,7 @@ std::optional<SSTableEntry> SSTableReader::Get(const std::string& key) {
         ++read_stats_.bloom_negatives;
         return std::nullopt;
     }
+    if (index_enabled_) { return GetIndexed(key); }
     ++read_stats_.table_scans;
     Rewind();
     while (auto entry = Next()) {

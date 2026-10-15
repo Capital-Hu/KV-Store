@@ -137,7 +137,7 @@ void Store::RunFlush(const std::shared_ptr<FrozenTable>& frozen) {
     detail::SyncFile(path);
     detail::SyncParentDirectory(base_path_);
     Notify(FlushStage::SSTableSynced);
-    auto reader = std::make_unique<SSTableReader>(path);
+    auto reader = OpenSSTable(frozen->sstable_id);
 
     std::lock_guard<std::mutex> lock(mutex_);
     try {

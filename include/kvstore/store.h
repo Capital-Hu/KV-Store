@@ -32,7 +32,8 @@ public:
     explicit Store(const std::string& wal_path,
                    WalRecoveryMode recovery = WalRecoveryMode::Strict,
                    std::size_t flush_threshold_bytes = 4 * 1024 * 1024,
-                   std::size_t compaction_threshold_tables = 4);
+                   std::size_t compaction_threshold_tables = 4,
+                   std::size_t block_cache_capacity_bytes = kDefaultBlockCacheBytes);
     ~Store();
 
     // A file descriptor and its lock must have exactly one owner.
@@ -62,6 +63,7 @@ public:
     // Encoded entry sizes in the active/frozen tables; not allocator or map-node memory.
     std::size_t memtable_bytes() const;
     std::size_t frozen_memtable_bytes() const;
+    BlockCacheStats block_cache_stats() const;
 
     std::size_t truncated_tail_bytes() const { return truncated_tail_bytes_; }
 
@@ -109,6 +111,7 @@ private:
     void RunFlush(const std::shared_ptr<FrozenTable>& frozen);
     std::string WalPath(std::uint64_t id) const;
     std::string SSTablePath(std::uint64_t id) const;
+    std::unique_ptr<SSTableReader> OpenSSTable(std::uint64_t id) const;
     void Replay(int fd, MemTable& table, std::size_t& table_bytes, WalRecoveryMode recovery);
     void AppendAndSync(std::string_view bytes);
     void EnsureUsable() const;
@@ -117,6 +120,7 @@ private:
     int lock_fd_ = -1;
     std::string base_path_;
     Manifest manifest_;
+    std::shared_ptr<BlockCache> block_cache_;
     std::vector<std::unique_ptr<SSTableReader>> sstables_;
     MemTable table_;
     std::shared_ptr<FrozenTable> frozen_;

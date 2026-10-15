@@ -31,8 +31,11 @@ std::uint32_t MergeSSTables(const std::vector<std::string>& inputs,
     heads.reserve(inputs.size());
     // Validate all input files before creating output. Each reader has its own cursor.
     for (const auto& path : inputs) {
-        // Full sequential scans cannot skip keys; avoid unused per-input filters.
-        auto reader = std::make_unique<SSTableReader>(path, false);
+        // Sequential scans do not need point-lookup metadata and must not pollute the cache.
+        SSTableReadOptions options;
+        options.use_bloom_filter = false;
+        options.use_block_index = false;
+        auto reader = std::make_unique<SSTableReader>(path, std::move(options));
         reader->Rewind();
         heads.push_back(reader->Next());
         readers.push_back(std::move(reader));
