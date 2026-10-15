@@ -43,4 +43,8 @@ void MemTable::Clear() {
     entries_.clear();
 }
 
+void MemTable::Swap(MemTable& other) noexcept {
+    entries_.swap(other.entries_);
+}
+
 }  // namespace kvstore

@@ -71,11 +71,40 @@ void TestCountLimit() {
     Reject([&] { kvstore::EncodeManifest(excessive); });
 }
 
+void TestFrozenWalFormatAndValidation() {
+    for (const std::uint64_t frozen_id : {0, 2}) {
+        const kvstore::Manifest expected{4, 5, {1}, frozen_id};
+        const auto bytes = kvstore::EncodeManifest(expected);
+        Check(bytes.substr(0, 4) == "KVM2" && bytes.size() == 44, "Two-WAL format has one extra 64-bit field");
+        const auto actual = kvstore::DecodeManifest(bytes);
+        Check(actual.frozen_wal_id == frozen_id && actual.wal_id == 4 && actual.sstable_ids == expected.sstable_ids,
+              "Frozen WAL zero is present, not absent");
+        for (std::size_t size = 0; size < bytes.size(); ++size) {
+            Reject([&] { kvstore::DecodeManifest(std::string_view(bytes).substr(0, size)); });
+        }
+        for (std::size_t offset = 0; offset < bytes.size(); ++offset) {
+            auto damaged = bytes; damaged[offset] ^= 1;
+            Reject([&] { kvstore::DecodeManifest(damaged); });
+        }
+        Reject([&] { kvstore::DecodeManifest(bytes + "X"); });
+    }
+    for (const auto& invalid : std::vector<kvstore::Manifest>{{4, 5, {1}, 4}, {4, 5, {1}, 5}, {4, 5, {2}, 2}}) {
+        Reject([&] { kvstore::EncodeManifest(invalid); });
+    }
+    auto bytes = kvstore::EncodeManifest({4, 5, {1}, 2});
+    bytes.replace(24, 8, 8, '\0');
+    bytes[24] = 4;  // An active/frozen WAL collision is invalid even with a valid CRC.
+    bytes.resize(bytes.size() - 4);
+    kvstore::detail::AppendU32(bytes, kvstore::detail::Crc32(bytes));
+    Reject([&] { kvstore::DecodeManifest(bytes); });
+}
+
 int main() {
     try {
         TestRoundTripAndOrder(); TestGoldenBytes(); TestTruncationAndCorruption();
         TestInvalidIdsEvenWithValidChecksum(); TestCountLimit();
-        std::cout << "All 5 manifest tests passed.\n";
+        TestFrozenWalFormatAndValidation();
+        std::cout << "All 6 manifest tests passed.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Manifest test failed: " << error.what() << '\n';

@@ -47,6 +47,18 @@ std::size_t EntryBytes(const std::string& key, const std::optional<std::string>&
     return 17 + key.size() + (value ? value->size() : 0);
 }
 
+void Apply(MemTable& table, std::size_t& bytes, const std::string& key,
+           const std::optional<std::string>& value) {
+    const auto old = table.Lookup(key);
+    const auto old_bytes = old ? EntryBytes(old->key, old->value) : 0;
+    const auto new_bytes = EntryBytes(key, value);
+    if (new_bytes > std::numeric_limits<std::size_t>::max() - (bytes - old_bytes)) {
+        throw std::length_error("MemTable byte accounting overflow");
+    }
+    if (value) { table.Put(key, *value); } else { table.Delete(key); }
+    bytes = bytes - old_bytes + new_bytes;
+}
+
 }  // namespace
 
 Store::Store(const std::string& wal_path, WalRecoveryMode recovery, std::size_t flush_threshold_bytes,
@@ -75,11 +87,24 @@ Store::Store(const std::string& wal_path, WalRecoveryMode recovery, std::size_t 
         for (const auto id : manifest_.sstable_ids) {
             sstables_.push_back(std::make_unique<SSTableReader>(SSTablePath(id)));
         }
+        if (manifest_.frozen_wal_id) {
+            frozen_ = std::make_shared<FrozenTable>();
+            frozen_->wal_id = *manifest_.frozen_wal_id;
+            detail::OwnedFd old_wal(detail::OpenRegular(WalPath(frozen_->wal_id), O_RDONLY));
+            // A frozen WAL was synced before rotation; never truncate it implicitly.
+            Replay(old_wal.get(), frozen_->table, frozen_->bytes, WalRecoveryMode::Strict);
+            if (frozen_->bytes == 0) { throw std::runtime_error("Frozen WAL must contain pending entries"); }
+            if (manifest_.next_file_id == std::numeric_limits<std::uint64_t>::max()) {
+                throw std::length_error("Store file IDs exhausted");
+            }
+            frozen_->sstable_id = manifest_.next_file_id++;
+            frozen_->request = ++flush_requested_;
+        }
         // An existing manifest must refer to an existing WAL, never a recreated empty one.
         fd_ = detail::OpenRegular(WalPath(manifest_.wal_id),
                                   O_RDWR | O_APPEND | (has_manifest ? 0 : O_CREAT));
         detail::LockExclusive(fd_);
-        Replay(recovery);
+        Replay(fd_, table_, table_bytes_, recovery);
         detail::SyncFile(fd_);
         detail::SyncParentDirectory(base_path_);
         if (!has_manifest) {
@@ -90,7 +115,17 @@ Store::Store(const std::string& wal_path, WalRecoveryMode recovery, std::size_t 
         // Validate every live file first; only then remove unpublished/obsolete files.
         CleanupObsoleteFiles();
         worker_ = std::thread(&Store::BackgroundLoop, this);
+        flush_worker_ = std::thread(&Store::FlushLoop, this);
     } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            if (!flush_worker_.joinable()) { flush_stopped_ = true; }
+            work_ready_.notify_one();
+            flush_ready_.notify_one();
+        }
+        if (flush_worker_.joinable()) { flush_worker_.join(); }
+        if (worker_.joinable()) { worker_.join(); }
         if (fd_ != -1) { ::close(fd_); fd_ = -1; }
         if (lock_fd_ != -1) { ::close(lock_fd_); lock_fd_ = -1; }
         throw;
@@ -102,8 +137,10 @@ Store::~Store() {
         std::lock_guard<std::mutex> lock(mutex_);
         stopping_ = true;
         work_ready_.notify_one();
+        flush_ready_.notify_one();
     }
     // Join without holding mutex_: the worker needs it to finish queued jobs.
+    if (flush_worker_.joinable()) { flush_worker_.join(); }
     if (worker_.joinable()) { worker_.join(); }
     if (fd_ != -1) { ::close(fd_); }
     if (lock_fd_ != -1) { ::close(lock_fd_); }
@@ -118,14 +155,18 @@ std::string Store::SSTablePath(std::uint64_t id) const {
 }
 
 void Store::Notify(FlushStage stage) {
-    if (flush_hook_) { flush_hook_(stage); }
+    if (active_flush_hook_) { active_flush_hook_(stage); }
 }
 
 void Store::Notify(CompactStage stage) {
     if (active_compact_hook_) { active_compact_hook_(stage); }
 }
 
-void Store::PublishManifest(const Manifest& manifest, bool for_compaction) {
+void Store::Notify(FreezeStage stage) {
+    if (freeze_hook_) { freeze_hook_(stage); }
+}
+
+void Store::PublishManifest(const Manifest& manifest, Publication publication) {
     const auto bytes = EncodeManifest(manifest);
     const auto path = base_path_ + ".manifest";
     const auto temporary = path + ".tmp";
@@ -134,15 +175,19 @@ void Store::PublishManifest(const Manifest& manifest, bool for_compaction) {
         detail::WriteAll(fd.get(), bytes);
         detail::SyncFile(fd.get());
     }
-    if (for_compaction) { Notify(CompactStage::ManifestTempSynced); }
-    else { Notify(FlushStage::ManifestTempSynced); }
+    const auto notify = [this, publication](FlushStage flush, CompactStage compact, FreezeStage freeze) {
+        switch (publication) {
+        case Publication::Freeze: Notify(freeze); break;
+        case Publication::Flush: Notify(flush); break;
+        case Publication::Compaction: Notify(compact); break;
+        }
+    };
+    notify(FlushStage::ManifestTempSynced, CompactStage::ManifestTempSynced, FreezeStage::ManifestTempSynced);
     if (::rename(temporary.c_str(), path.c_str()) == -1) { detail::ThrowSystemError("Publish manifest"); }
-    if (for_compaction) { Notify(CompactStage::ManifestRenamed); }
-    else { Notify(FlushStage::ManifestRenamed); }
+    notify(FlushStage::ManifestRenamed, CompactStage::ManifestRenamed, FreezeStage::ManifestRenamed);
     // rename changes visibility atomically; directory synchronization makes it durable.
     detail::SyncParentDirectory(path);
-    if (for_compaction) { Notify(CompactStage::ManifestDurable); }
-    else { Notify(FlushStage::ManifestDurable); }
+    notify(FlushStage::ManifestDurable, CompactStage::ManifestDurable, FreezeStage::ManifestDurable);
 }
 
 void Store::CleanupObsoleteFiles() {
@@ -153,32 +198,29 @@ void Store::CleanupObsoleteFiles() {
         const auto filename = file.path().filename().string();
         const auto table_id = FileId(filename, name + ".sst.");
         const auto wal_id = FileId(filename, name + ".wal.");
-        if ((table_id && live.count(*table_id) == 0) || (wal_id && *wal_id != manifest_.wal_id)) {
+        if ((table_id && live.count(*table_id) == 0) ||
+            (wal_id && *wal_id != manifest_.wal_id &&
+             (!manifest_.frozen_wal_id || *wal_id != *manifest_.frozen_wal_id))) {
             obsolete.push_back(file.path().string());
         }
     }
-    if (manifest_.wal_id != 0) { obsolete.push_back(base_path_); }
+    if (manifest_.wal_id != 0 && (!manifest_.frozen_wal_id || *manifest_.frozen_wal_id != 0)) {
+        obsolete.push_back(base_path_);
+    }
     obsolete.push_back(base_path_ + ".manifest.tmp");
     for (const auto& path : obsolete) { detail::RemoveFile(path); }
     detail::SyncParentDirectory(base_path_);
 }
 
 void Store::ApplyToMemTable(const std::string& key, const std::optional<std::string>& value) {
-    const auto old = table_.Lookup(key);
-    const auto old_bytes = old ? EntryBytes(old->key, old->value) : 0;
-    const auto new_bytes = EntryBytes(key, value);
-    if (new_bytes > std::numeric_limits<std::size_t>::max() - (table_bytes_ - old_bytes)) {
-        throw std::length_error("MemTable byte accounting overflow");
-    }
-    if (value) { table_.Put(key, *value); } else { table_.Delete(key); }
-    table_bytes_ = table_bytes_ - old_bytes + new_bytes;
+    Apply(table_, table_bytes_, key, value);
 }
-void Store::Replay(WalRecoveryMode recovery) {
+void Store::Replay(int fd, MemTable& table, std::size_t& table_bytes, WalRecoveryMode recovery) {
     std::string pending;
     off_t valid_bytes = 0;
     char chunk[64 * 1024];
     for (;;) {
-        const auto count = ::read(fd_, chunk, sizeof(chunk));
+        const auto count = ::read(fd, chunk, sizeof(chunk));
         if (count == -1) {
             if (errno == EINTR) {
                 continue;
@@ -200,9 +242,9 @@ void Store::Replay(WalRecoveryMode recovery) {
             }
             const auto& record = result.record.value();
             if (record.type == WalRecordType::Put) {
-                ApplyToMemTable(record.key, record.value);
+                Apply(table, table_bytes, record.key, record.value);
             } else {
-                ApplyToMemTable(record.key, std::nullopt);
+                Apply(table, table_bytes, record.key, std::nullopt);
             }
             consumed += result.bytes_consumed;
             valid_bytes += static_cast<off_t>(result.bytes_consumed);
@@ -218,7 +260,7 @@ void Store::Replay(WalRecoveryMode recovery) {
         // A corrupt length field can also look incomplete; do not repair implicitly.
         int result;
         do {
-            result = ::ftruncate(fd_, valid_bytes);
+            result = ::ftruncate(fd, valid_bytes);
         } while (result == -1 && errno == EINTR);
         if (result == -1) {
             detail::ThrowSystemError("Truncate incomplete WAL tail");
@@ -235,6 +277,7 @@ void Store::EnsureUsable() const {
 void Store::FailLocked() {
     usable_ = false;
     work_ready_.notify_one();
+    flush_ready_.notify_one();
     work_done_.notify_all();
 }
 
@@ -243,18 +286,19 @@ void Store::AppendAndSync(std::string_view bytes) {
     detail::SyncFile(fd_);
 }
 
-void Store::MaybeFlush() {
-    if (flush_threshold_bytes_ != 0 && table_bytes_ >= flush_threshold_bytes_) { FlushLocked(); }
+void Store::MaybeFlush(std::unique_lock<std::mutex>& lock) {
+    if (flush_threshold_bytes_ != 0 && table_bytes_ >= flush_threshold_bytes_) { FreezeLocked(lock); }
 }
 
 void Store::Put(const std::string& key, const std::string& value) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     EnsureUsable();
     const auto bytes = EncodeWalRecord({WalRecordType::Put, key, value});
+    WaitForWriteRoomLocked(lock);
     try {
         AppendAndSync(bytes);
         ApplyToMemTable(key, value);
-        MaybeFlush();
+        MaybeFlush(lock);
     } catch (...) {
         FailLocked();
         throw;
@@ -270,6 +314,10 @@ std::optional<std::string> Store::Get(const std::string& key) const {
 std::optional<std::string> Store::GetLocked(const std::string& key) const {
     const auto memory = table_.Lookup(key);
     if (memory) { return memory->value; }  // Includes tombstones: stop, do not search older files.
+    if (frozen_) {
+        const auto frozen = frozen_->table.Lookup(key);
+        if (frozen) { return frozen->value; }
+    }
     for (auto it = sstables_.rbegin(); it != sstables_.rend(); ++it) {
         const auto entry = (*it)->Get(key);
         if (entry) {
@@ -281,76 +329,16 @@ std::optional<std::string> Store::GetLocked(const std::string& key) const {
 }
 
 bool Store::Delete(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     EnsureUsable();
     const auto bytes = EncodeWalRecord({WalRecordType::Delete, key, ""});
+    WaitForWriteRoomLocked(lock);
     const bool existed = GetLocked(key).has_value();  // Check the complete view, not only the MemTable.
     try {
         AppendAndSync(bytes);
         ApplyToMemTable(key, std::nullopt);
-        MaybeFlush();
+        MaybeFlush(lock);
         return existed;
-    } catch (...) {
-        FailLocked();
-        throw;
-    }
-}
-
-void Store::Flush() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    EnsureUsable();
-    FlushLocked();
-}
-
-void Store::FlushLocked() {
-    const auto snapshot = table_.Snapshot();
-    if (snapshot.empty()) { return; }
-    if (manifest_.next_file_id > std::numeric_limits<std::uint64_t>::max() - 2) {
-        throw std::length_error("Store file IDs exhausted");
-    }
-    Manifest next = manifest_;
-    const auto table_id = next.next_file_id;
-    next.wal_id = table_id + 1;
-    next.next_file_id += 2;
-    next.sstable_ids.push_back(table_id);
-    // Validate metadata and reserve in-memory space before publishing anything.
-    EncodeManifest(next);
-    sstables_.reserve(next.sstable_ids.size());
-    std::vector<SSTableEntry> entries;
-    entries.reserve(snapshot.size());
-    for (const auto& entry : snapshot) {
-        const auto type = entry.value ? SSTableEntryType::Value : SSTableEntryType::Tombstone;
-        entries.push_back({type, entry.key, entry.value.value_or("")});
-    }
-    try {
-        WriteSSTable(SSTablePath(table_id), entries);
-        Notify(FlushStage::SSTableWritten);
-        detail::SyncFile(SSTablePath(table_id));
-        Notify(FlushStage::SSTableSynced);
-        auto reader = std::make_unique<SSTableReader>(SSTablePath(table_id));
-        detail::OwnedFd new_wal(detail::OpenRegular(WalPath(next.wal_id), O_RDWR | O_APPEND | O_CREAT | O_EXCL));
-        detail::LockExclusive(new_wal.get());
-        detail::SyncFile(new_wal.get());
-        detail::SyncParentDirectory(base_path_);  // Persist BOTH new data-file names before publication.
-        Notify(FlushStage::WalSynced);
-        PublishManifest(next);
-        // After the directory sync, the new file set is authoritative and durable.
-        const auto old_wal_path = WalPath(manifest_.wal_id);
-        const int old_fd = fd_;
-        manifest_ = std::move(next);
-        sstables_.push_back(std::move(reader));
-        fd_ = new_wal.Release();
-        ::close(old_fd);
-        table_.Clear();
-        table_bytes_ = 0;
-        Notify(FlushStage::WalSwitched);
-        detail::RemoveFile(old_wal_path);
-        Notify(FlushStage::OldWalRemoved);
-        detail::SyncParentDirectory(base_path_);
-        if (compaction_threshold_tables_ != 0 &&
-            manifest_.sstable_ids.size() >= compaction_threshold_tables_) {
-            ScheduleCompactionLocked();
-        }
     } catch (...) {
         FailLocked();
         throw;
@@ -365,6 +353,11 @@ std::size_t Store::sstable_count() const {
 std::size_t Store::memtable_bytes() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return table_bytes_;
+}
+
+std::size_t Store::frozen_memtable_bytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return frozen_ ? frozen_->bytes : 0;
 }
 
 }  // namespace kvstore

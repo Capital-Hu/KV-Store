@@ -30,8 +30,10 @@ public:
     // This is an export for flushing, not a transaction or an MVCC snapshot.
     std::vector<MemTableEntry> Snapshot() const;
 
-    // A Store must publish the replacement data before clearing its current table.
+    // Discard entries only after their recovery or replacement is secured.
     void Clear();
+    // Transfer ownership without copying entries or allocating during a WAL switch.
+    void Swap(MemTable& other) noexcept;
 
 private:
     std::map<std::string, std::optional<std::string>> entries_;

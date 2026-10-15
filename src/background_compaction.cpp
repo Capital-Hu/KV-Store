@@ -33,6 +33,8 @@ void Store::WaitLocked(std::unique_lock<std::mutex>& lock, std::uint64_t target)
 void Store::WaitForBackgroundWork() {
     std::unique_lock<std::mutex> lock(mutex_);
     EnsureUsable();
+    const auto flush_target = flush_requested_;
+    WaitForFlushLocked(lock, flush_target);
     WaitLocked(lock, requested_);
 }
 
@@ -50,9 +52,9 @@ void Store::BackgroundLoop() {
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 work_ready_.wait(lock, [this] {
-                    return stopping_ || !usable_ || requested_ > completed_;
+                    return !usable_ || requested_ > completed_ || (stopping_ && flush_stopped_);
                 });
-                if (!usable_ || (stopping_ && requested_ == completed_)) { return; }
+                if (!usable_ || (stopping_ && flush_stopped_ && requested_ == completed_)) { return; }
                 // Requests already queued can share one pass; newer requests get another pass.
                 target = requested_;
                 active_compact_hook_ = compact_hook_;
@@ -116,7 +118,7 @@ void Store::RunCompaction() {
         std::vector<std::unique_ptr<SSTableReader>> replacement;
         replacement.reserve(next.sstable_ids.size());
         replacement.push_back(std::move(reader));
-        PublishManifest(next, true);
+        PublishManifest(next, Publication::Compaction);
         for (std::size_t i = old_ids.size(); i < sstables_.size(); ++i) {
             replacement.push_back(std::move(sstables_[i]));
         }

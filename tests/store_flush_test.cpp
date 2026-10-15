@@ -3,9 +3,11 @@
 
 #include <cerrno>
 #include <csignal>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <stdexcept>
@@ -19,16 +21,22 @@ namespace kvstore {
 // Only this test executable can install callbacks at private protocol boundaries.
 struct StoreTestAccess {
     using Stage = Store::FlushStage;
+    using FreezeStage = Store::FreezeStage;
     static void Hook(Store& store, std::function<void(Stage)> callback) {
+        std::lock_guard<std::mutex> lock(store.mutex_);
         store.flush_hook_ = std::move(callback);
+    }
+    static void FreezeHook(Store& store, std::function<void(FreezeStage)> callback) {
+        std::lock_guard<std::mutex> lock(store.mutex_);
+        store.freeze_hook_ = std::move(callback);
     }
 };
 }  // namespace kvstore
 
 using Stage = kvstore::StoreTestAccess::Stage;
 const std::vector<Stage> stages = {
-    Stage::SSTableWritten, Stage::SSTableSynced, Stage::WalSynced, Stage::ManifestTempSynced,
-    Stage::ManifestRenamed, Stage::ManifestDurable, Stage::WalSwitched, Stage::OldWalRemoved,
+    Stage::SSTableWritten, Stage::SSTableSynced, Stage::ManifestTempSynced,
+    Stage::ManifestRenamed, Stage::ManifestDurable, Stage::FrozenCleared, Stage::OldWalRemoved,
 };
 
 void Check(bool condition, const std::string& message) {
@@ -182,7 +190,8 @@ void TestThresholdAndByteAccounting() {
     store.Delete("a"); store.Delete("b");
     Check(store.memtable_bytes() == 36 && store.sstable_count() == 0, "Tombstones contribute key and record overhead");
     store.Put("c", "");
-    Check(store.memtable_bytes() == 0 && store.sstable_count() == 1, "Reaching threshold synchronously flushes");
+    store.WaitForBackgroundWork();
+    Check(store.memtable_bytes() == 0 && store.sstable_count() == 1, "Reaching threshold queues a background flush");
     Check(!store.Get("a") && !store.Get("b") && store.Get("c") == "", "Automatic flush preserves all states");
 }
 
@@ -192,6 +201,7 @@ void TestAutomaticDefaultAndDisabledThreshold() {
         kvstore::Store store(directory.Base(), kvstore::WalRecoveryMode::Strict, automatic ? 4 * 1024 * 1024 : 0);
         const std::string value(kvstore::kMaxWalPayloadBytes - 1, 'v');
         for (const auto& key : {"a", "b", "c", "d"}) { store.Put(key, value); }
+        store.WaitForBackgroundWork();
         Check(store.sstable_count() == (automatic ? 1U : 0U), "Default threshold or manual-only option");
         if (!automatic) { store.Flush(); }
         Check(store.Get("d") == value, "Large automatic or manual flush reads back correctly");
@@ -331,7 +341,10 @@ void TestKilledFlushAtEveryStage() {
                 try {
                     kvstore::Store store(base); Prepare(store);
                     kvstore::StoreTestAccess::Hook(store, [index](Stage stage) {
-                        if (stage == stages[index]) { ::kill(::getpid(), SIGKILL); ::_exit(3); }
+                        if (stage == stages[index]) {
+                            ::kill(::getpid(), SIGKILL);
+                            for (;;) { ::pause(); }
+                        }
                     });
                     store.Flush();
                 } catch (...) { ::_exit(2); }
@@ -340,9 +353,9 @@ void TestKilledFlushAtEveryStage() {
             Child child(pid);
             const int status = child.Wait();
             Check(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "Child must reach the chosen stage and be killed");
-            const std::size_t expected_count = (already_flushed ? 1 : 0) + (index >= 4 ? 1 : 0);
+            const std::size_t expected_count = (already_flushed ? 1 : 0) + (index >= 3 ? 1 : 0);
             Check(Metadata(base).sstable_ids.size() == expected_count, "Visible manifest selects old or new complete file set");
-            Check(std::filesystem::exists(old_wal) == (index < 7),
+            Check(std::filesystem::exists(old_wal) == (index < 6),
                   "Old WAL must remain through durable publication and disappear only at retirement");
             {
                 kvstore::Store store(base); CheckRecovered(store); store.Flush();
@@ -373,39 +386,189 @@ void TestExceptionsStopStoreAndRecover() {
 }
 
 void TestRealPartialFlushWrites() {
-    for (const auto limit_bytes : {4, 35}) {
+    for (const bool during_freeze : {true, false}) {
+        for (const auto limit_bytes : {4, 35}) {
+            TestDirectory directory;
+            const auto base = directory.Base();
+            { kvstore::Store store(base); store.Put("k", "v"); }
+            const auto metadata_before = Read(base + ".manifest");
+            const auto wal_before = Read(base);
+            const auto pid = ::fork();
+            Check(pid != -1, "Fork failed-flush test");
+            if (pid == 0) {
+                try {
+                    kvstore::Store store(base);
+                    Check(::signal(SIGXFSZ, SIG_IGN) != SIG_ERR, "Ignore file-size signal");
+                    const auto install_limit = [limit_bytes] {
+                        struct rlimit limit {};
+                        Check(::getrlimit(RLIMIT_FSIZE, &limit) == 0, "Read resource limit");
+                        limit.rlim_cur = limit_bytes;
+                        Check(::setrlimit(RLIMIT_FSIZE, &limit) == 0, "Set child-only resource limit");
+                    };
+                    if (during_freeze) { install_limit(); }
+                    else {
+                        kvstore::StoreTestAccess::FreezeHook(store, [install_limit](auto stage) {
+                            if (stage == kvstore::StoreTestAccess::FreezeStage::MemTableFrozen) { install_limit(); }
+                        });
+                    }
+                    bool failed = false;
+                    try { store.Flush(); } catch (const std::system_error&) { failed = true; }
+                    Check(failed, "OS must report a real partial write");
+                    Reject([&] { store.Get("k"); }, "Failed flush must disable Store");
+                    ::_exit(0);
+                } catch (...) { ::_exit(2); }
+            }
+            Child child(pid);
+            const auto status = child.Wait();
+            Check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "Child must verify partial-write error");
+            const auto partial_path = !during_freeze && limit_bytes == 4 ? Table(base, 1) : base + ".manifest.tmp";
+            Check(std::filesystem::file_size(partial_path) == static_cast<std::size_t>(limit_bytes), "Real partial file must exist");
+            const auto expected_metadata = during_freeze ? metadata_before : kvstore::EncodeManifest({2, 3, {}, 0});
+            Check(Read(base + ".manifest") == expected_metadata && Read(base) == wal_before,
+                  "Failure preserves either the old WAL or the published two-WAL recovery set");
+            kvstore::Store recovered(base);
+            Check(recovered.Get("k") == "v", "Recovery WAL preserves acknowledged data");
+            recovered.Flush();
+            Check(recovered.Get("k") == "v", "Retry after orphan cleanup must work");
+        }
+    }
+}
+
+void TestKilledFreezeAtEveryStage() {
+    using FreezeStage = kvstore::StoreTestAccess::FreezeStage;
+    const std::vector<FreezeStage> freeze_stages = {
+        FreezeStage::WalSynced, FreezeStage::ManifestTempSynced, FreezeStage::ManifestRenamed,
+        FreezeStage::ManifestDurable, FreezeStage::MemTableFrozen,
+    };
+    for (bool already_flushed : {false, true}) {
+        for (std::size_t index = 0; index < freeze_stages.size(); ++index) {
+            TestDirectory directory;
+            const auto base = directory.Base();
+            {
+                kvstore::Store store(base); store.Put("name", "Alice"); store.Put("removed", "old");
+                if (already_flushed) { store.Flush(); }
+            }
+            const auto before = Metadata(base);
+            const auto old_wal = Wal(base, before);
+            const auto pid = ::fork();
+            Check(pid != -1, "Fork interrupted freeze");
+            if (pid == 0) {
+                try {
+                    kvstore::Store store(base); Prepare(store);
+                    kvstore::StoreTestAccess::FreezeHook(store, [&, index](FreezeStage stage) {
+                        if (stage == freeze_stages[index]) {
+                            ::kill(::getpid(), SIGKILL);
+                            for (;;) { ::pause(); }
+                        }
+                    });
+                    store.RequestFlush();
+                    ::_exit(4);
+                } catch (...) { ::_exit(2); }
+            }
+            Child child(pid);
+            const auto status = child.Wait();
+            Check(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "Child reaches freeze boundary");
+            const auto after = Metadata(base);
+            Check(after.sstable_ids == before.sstable_ids, "Freeze does not publish an SSTable");
+            Check(after.frozen_wal_id == (index >= 2 ? std::optional<std::uint64_t>{before.wal_id} : std::nullopt),
+                  "Manifest chooses one-WAL or two-WAL recovery");
+            Check(std::filesystem::exists(old_wal), "Old WAL remains throughout freeze");
+            kvstore::Store reopened(base); CheckRecovered(reopened); reopened.WaitForBackgroundWork();
+            reopened.Put("next", "ok"); reopened.Flush();
+            Check(reopened.Get("next") == "ok", "Recovery can continue after interrupted freeze");
+        }
+    }
+}
+
+void TestFrozenWalValidation() {
+    for (const auto& damage : {"missing", "checksum", "tail", "empty"}) {
         TestDirectory directory;
         const auto base = directory.Base();
-        { kvstore::Store store(base); store.Put("k", "v"); }
-        const auto metadata_before = Read(base + ".manifest");
-        const auto wal_before = Read(base);
+        auto frozen = kvstore::EncodeWalRecord({kvstore::WalRecordType::Put, "k", "old"});
+        if (std::string(damage) == "checksum") { frozen.back() ^= 1; }
+        if (std::string(damage) == "tail") { frozen += "KVW"; }
+        if (std::string(damage) == "empty") { frozen.clear(); }
+        if (std::string(damage) != "missing") { Write(base, frozen); }
+        Write(base + ".wal.2", kvstore::EncodeWalRecord({kvstore::WalRecordType::Put, "k", "new"}));
+        Write(base + ".manifest", kvstore::EncodeManifest({2, 3, {}, 0}));
+        Write(base + ".sst.999", "evidence");
+        for (const auto mode : {kvstore::WalRecoveryMode::Strict, kvstore::WalRecoveryMode::TruncateIncompleteTail}) {
+            Reject([&] { kvstore::Store store(base, mode); }, "Frozen WAL must exist and be fully valid in every recovery mode");
+        }
+        Check(Read(base + ".sst.999") == "evidence", "Validate live WALs before orphan cleanup");
+        if (std::string(damage) != "missing") { Check(Read(base) == frozen, "Never repair frozen WAL"); }
+        else { Check(!std::filesystem::exists(base), "Never recreate missing frozen WAL"); }
+    }
+}
+
+void TestTwoWalRecoveryAndActiveTail() {
+    TestDirectory directory;
+    const auto base = directory.Base();
+    kvstore::WriteSSTable(Table(base, 1), {{kvstore::SSTableEntryType::Value, "gone", "old"}});
+    const auto frozen = kvstore::EncodeWalRecord({kvstore::WalRecordType::Put, "k", "older"}) +
+                        kvstore::EncodeWalRecord({kvstore::WalRecordType::Put, "frozen-only", "saved"}) +
+                        kvstore::EncodeWalRecord({kvstore::WalRecordType::Delete, "gone", ""});
+    const auto active = kvstore::EncodeWalRecord({kvstore::WalRecordType::Put, "k", "newer"});
+    Write(base + ".wal.2", frozen);
+    Write(base + ".wal.4", active + "KVW");
+    Write(base + ".manifest", kvstore::EncodeManifest({4, 5, {1}, 2}));
+    Reject([&] { kvstore::Store store(base); }, "Strict recovery rejects active tail with frozen WAL present");
+    Check(Read(base + ".wal.2") == frozen && Read(base + ".wal.4") == active + "KVW", "Strict failure preserves both WALs");
+    {
+        kvstore::Store store(base, kvstore::WalRecoveryMode::TruncateIncompleteTail);
+        Check(store.truncated_tail_bytes() == 3 && store.Get("k") == "newer" && !store.Get("gone") &&
+              store.Get("frozen-only") == "saved", "Replay order is active, frozen, then older SSTables for reads");
+        store.WaitForBackgroundWork();
+        Check(!Metadata(base).frozen_wal_id && !std::filesystem::exists(base + ".wal.2"), "Recovered frozen table finishes flushing");
+    }
+    kvstore::Store reopened(base);
+    Check(reopened.Get("k") == "newer" && !reopened.Get("gone") && reopened.Get("frozen-only") == "saved",
+          "Both recovered WAL generations survive a second reopen");
+}
+
+void TestKilledFlushWithActiveWrites() {
+    for (std::size_t index = 0; index < stages.size(); ++index) {
+        TestDirectory directory;
+        const auto base = directory.Base();
+        { kvstore::Store store(base); store.Put("name", "Alice"); store.Put("removed", "old"); store.Flush(); }
+        const auto before = Metadata(base);
         const auto pid = ::fork();
-        Check(pid != -1, "Fork failed-flush test");
+        Check(pid != -1, "Fork flush with newer active writes");
         if (pid == 0) {
             try {
-                kvstore::Store store(base);
-                Check(::signal(SIGXFSZ, SIG_IGN) != SIG_ERR, "Ignore file-size signal");
-                struct rlimit limit {};
-                Check(::getrlimit(RLIMIT_FSIZE, &limit) == 0, "Read resource limit");
-                limit.rlim_cur = limit_bytes;
-                Check(::setrlimit(RLIMIT_FSIZE, &limit) == 0, "Set child-only resource limit");
-                bool failed = false;
-                try { store.Flush(); } catch (const std::system_error&) { failed = true; }
-                Check(failed, "OS must report a real partial write");
-                Reject([&] { store.Get("k"); }, "Failed flush must disable Store");
-                ::_exit(0);
+                kvstore::Store store(base, kvstore::WalRecoveryMode::Strict, 0, 0);
+                auto ready = std::make_shared<std::promise<void>>();
+                auto entered = ready->get_future();
+                auto release = std::make_shared<std::promise<void>>();
+                auto released = release->get_future().share();
+                struct ReleaseOnExit {
+                    std::shared_ptr<std::promise<void>> value;
+                    ~ReleaseOnExit() { if (value) { value->set_value(); } }
+                } guard{release};
+                Prepare(store);
+                kvstore::StoreTestAccess::Hook(store, [ready, released, index](Stage stage) {
+                    if (stage == Stage::SSTableWritten) { ready->set_value(); released.wait(); }
+                    if (stage == stages[index]) {
+                        ::kill(::getpid(), SIGKILL);
+                        for (;;) { ::pause(); }
+                    }
+                });
+                store.RequestFlush();
+                Check(entered.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "Pause flush output");
+                store.Put("name", "Charlie"); store.Delete("empty"); store.Put("active-only", "saved");
+                release->set_value(); guard.value.reset();
+                store.WaitForBackgroundWork();
+                ::_exit(4);
             } catch (...) { ::_exit(2); }
         }
         Child child(pid);
         const auto status = child.Wait();
-        Check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "Child must verify partial-write error");
-        const auto partial_path = limit_bytes == 4 ? Table(base, 1) : base + ".manifest.tmp";
-        Check(std::filesystem::file_size(partial_path) == static_cast<std::size_t>(limit_bytes), "Real partial file must exist");
-        Check(Read(base + ".manifest") == metadata_before && Read(base) == wal_before, "Unpublished flush must retain recovery state");
-        kvstore::Store recovered(base);
-        Check(recovered.Get("k") == "v", "Old WAL must recover acknowledged data");
-        recovered.Flush();
-        Check(recovered.Get("k") == "v", "Retry after orphan cleanup must work");
+        Check(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "Child reaches flush boundary after newer writes");
+        Check(Metadata(base).wal_id == before.next_file_id + 1, "Flush publication preserves the newer active WAL");
+        kvstore::Store reopened(base);
+        Check(reopened.Get("name") == "Charlie" && !reopened.Get("empty") && !reopened.Get("removed") &&
+              reopened.Get("active-only") == "saved", "New active writes and tombstones survive every frozen-flush boundary");
+        reopened.Flush();
     }
 }
 
@@ -417,7 +580,9 @@ int main() {
         TestCorruptLiveFilesPreserveEvidence(); TestTailRecoveryOnRotatedWal(); TestStableLockAcrossRotation();
         TestLegacyWalBootstrap(); TestRelativePathSurvivesDirectoryChange(); TestKilledFlushAtEveryStage();
         TestExceptionsStopStoreAndRecover(); TestRealPartialFlushWrites();
-        std::cout << "All 17 Store flush tests passed.\n";
+        TestKilledFreezeAtEveryStage(); TestFrozenWalValidation(); TestTwoWalRecoveryAndActiveTail();
+        TestKilledFlushWithActiveWrites();
+        std::cout << "All 21 Store flush tests passed.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Store flush test failed: " << error.what() << '\n';

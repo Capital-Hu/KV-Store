@@ -1,6 +1,6 @@
 # 最终目标与验收
 
-状态：进行中。第 7a 步后台 compaction 和 Store 并发访问已完成：合并期间允许前台读写/同步刷盘，发布时保留新增 SSTable 和当前 WAL。第 7b 步后台刷盘尚未开始，等待讨论和明确 OK。
+状态：进行中。第 7 步已完成：7a 后台 compaction，7b 后台刷盘、单冻结表背压、双 WAL 恢复及两个后台线程收尾。等待讨论和明确 OK 后，再开始第 8 步 Bloom filter。
 
 ## 必须完成的两部分
 
@@ -21,7 +21,7 @@
 - [x] 多层数据读取与删除标记处理，已验证更新覆盖、删除不复活及删除后重插。
 - [x] 同步全量 compaction、流式读写、删除标记规则、发布和回收中断验证，见 [第 6 步记录](docs/steps/06-compaction.md)。
 - [x] 后台 compaction 及并发正确性验证，见 [第 7a 步记录](docs/steps/07a-background-compaction.md)。
-- [ ] 后台刷盘：冻结 MemTable、多 WAL 恢复与资源上限（第 7b 步）。
+- [x] 后台刷盘：单冻结 MemTable 槽、双 WAL 恢复及自动阈值下的写入背压，见 [第 7b 步记录](docs/steps/07b-background-flush.md)。阈值不是精确堆内存上限；关闭自动阈值后由调用方控制可写表大小。
 - [ ] Bloom filter 及无假阴性的验证。
 - [ ] 有容量限制的 block cache 及淘汰行为验证。
 - [ ] 单机故障恢复集成验证。

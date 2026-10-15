@@ -46,27 +46,34 @@ public:
     std::optional<std::string> Get(const std::string& key) const;
     bool Delete(const std::string& key);
 
-    // Synchronously publish pending entries as a new SSTable and rotate the WAL.
-    // No pending entries means no work. Threshold 0 disables automatic flushing.
+    // Freeze pending entries and wait until their SSTable is durably published.
     void Flush();
+    // Rotate WAL and queue a frozen table; may wait for the one frozen slot.
+    // Threshold 0 disables automatic freezing, but manual requests still work.
+    void RequestFlush();
     // Queue a background merge and wait for this request to finish.
     void Compact();
     // Queue without waiting. Threshold 0 disables automatic compaction after Flush.
     void RequestCompaction();
-    // Wait for requests queued before this call; propagate any background failure.
+    // Wait for flushes queued before this call, then capture and wait for compaction requests.
+    // This includes automatic compaction scheduled by those flushes; failures propagate.
     void WaitForBackgroundWork();
     std::size_t sstable_count() const;
-    // Encoded entry sizes, including tombstones; not allocator or map-node memory.
+    // Encoded entry sizes in the active/frozen tables; not allocator or map-node memory.
     std::size_t memtable_bytes() const;
+    std::size_t frozen_memtable_bytes() const;
 
     std::size_t truncated_tail_bytes() const { return truncated_tail_bytes_; }
 
 private:
     // Deterministic test seam; production has no hook or environment-controlled faults.
     friend struct StoreTestAccess;
+    enum class FreezeStage {
+        WalSynced, ManifestTempSynced, ManifestRenamed, ManifestDurable, MemTableFrozen,
+    };
     enum class FlushStage {
-        SSTableWritten, SSTableSynced, WalSynced, ManifestTempSynced,
-        ManifestRenamed, ManifestDurable, WalSwitched, OldWalRemoved,
+        SSTableWritten, SSTableSynced, ManifestTempSynced,
+        ManifestRenamed, ManifestDurable, FrozenCleared, OldWalRemoved,
     };
     enum class CompactStage {
         SSTableWritten, SSTableSynced, ManifestTempSynced, ManifestRenamed,
@@ -74,21 +81,35 @@ private:
     };
     void Notify(FlushStage stage);
     void Notify(CompactStage stage);
-    void PublishManifest(const Manifest& manifest, bool for_compaction = false);
+    void Notify(FreezeStage stage);
+    enum class Publication { Freeze, Flush, Compaction };
+    void PublishManifest(const Manifest& manifest, Publication publication = Publication::Flush);
     void CleanupObsoleteFiles();
     void ApplyToMemTable(const std::string& key, const std::optional<std::string>& value);
-    void MaybeFlush();
+    void MaybeFlush(std::unique_lock<std::mutex>& lock);
     // These helpers require mutex_; public wrappers acquire it exactly once.
-    void FlushLocked();
+    std::uint64_t FreezeLocked(std::unique_lock<std::mutex>& lock);
+    void WaitForWriteRoomLocked(std::unique_lock<std::mutex>& lock);
+    void WaitForFlushLocked(std::unique_lock<std::mutex>& lock, std::uint64_t target);
     std::optional<std::string> GetLocked(const std::string& key) const;
     std::uint64_t ScheduleCompactionLocked();
     void WaitLocked(std::unique_lock<std::mutex>& lock, std::uint64_t target);
     void FailLocked();
     void BackgroundLoop();
     void RunCompaction();
+    struct FrozenTable {
+        MemTable table;
+        std::size_t bytes = 0;
+        std::uint64_t wal_id = 0;
+        std::uint64_t sstable_id = 0;
+        std::uint64_t request = 0;
+        std::function<void(FlushStage)> hook;
+    };
+    void FlushLoop();
+    void RunFlush(const std::shared_ptr<FrozenTable>& frozen);
     std::string WalPath(std::uint64_t id) const;
     std::string SSTablePath(std::uint64_t id) const;
-    void Replay(WalRecoveryMode recovery);
+    void Replay(int fd, MemTable& table, std::size_t& table_bytes, WalRecoveryMode recovery);
     void AppendAndSync(std::string_view bytes);
     void EnsureUsable() const;
 
@@ -98,10 +119,13 @@ private:
     Manifest manifest_;
     std::vector<std::unique_ptr<SSTableReader>> sstables_;
     MemTable table_;
+    std::shared_ptr<FrozenTable> frozen_;
     std::size_t table_bytes_ = 0;
     std::size_t flush_threshold_bytes_;
     std::size_t compaction_threshold_tables_;
     std::function<void(FlushStage)> flush_hook_;
+    std::function<void(FlushStage)> active_flush_hook_;
+    std::function<void(FreezeStage)> freeze_hook_;
     std::function<void(CompactStage)> compact_hook_;
     // Copied under mutex_ at job start; thereafter used only by the worker.
     std::function<void(CompactStage)> active_compact_hook_;
@@ -110,11 +134,16 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable work_ready_;
     std::condition_variable work_done_;
+    std::condition_variable flush_ready_;
+    std::uint64_t flush_requested_ = 0;
+    std::uint64_t flush_completed_ = 0;
     std::uint64_t requested_ = 0;
     std::uint64_t completed_ = 0;
     bool stopping_ = false;
+    bool flush_stopped_ = false;
     std::exception_ptr background_error_;
     std::thread worker_;
+    std::thread flush_worker_;
 };
 
 }  // namespace kvstore
