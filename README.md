@@ -2,7 +2,7 @@
 
 一个逐步实现、逐步讲解的 C++ 学习项目。先完成单机 LSM 存储引擎，再完成三节点 Raft 复制。两部分都是最终验收要求。
 
-当前完成 **第 7 步：后台 compaction 与后台刷盘**。先将 MemTable 冻结并切换 WAL，再由刷盘线程生成 SSTable；查询顺序为可写表、冻结表、SSTable。最多一张冻结表，槽满时等待，重启依清单恢复最多两个 WAL。刷盘和合并各用一个后台线程，发布时共用状态锁。`Flush()` / `Compact()` 仍等待各自完成，异步请求使用 `RequestFlush()` / `RequestCompaction()`。
+当前完成 **第 8 步：SSTable Bloom filter**。查询先查可写表、冻结表，再从新到旧访问 SSTable；每张表先用内存 Bloom filter 判断，确定没有就跳过，可能存在才精确扫描。删除标记的 key 同样加入过滤器。过滤器在打开文件的完整校验期间重建，暂不持久化，SSTable/WAL/manifest 的文件格式不变。第 7 步的后台刷盘、合并、双 WAL 恢复与背压继续使用。
 
 ## 从哪里看
 
@@ -18,6 +18,7 @@
 - [第 6 步讲解](docs/steps/06-compaction.md)：流式有序合并、删除标记规则、SSTable 游标/逐条写入、同步发布与回收。
 - [第 7a 步讲解](docs/steps/07a-background-compaction.md)：后台线程、锁的范围、新旧文件交接、等待与退出。
 - [第 7b 步讲解](docs/steps/07b-background-flush.md)：冻结表、两次清单发布、双 WAL 恢复、背压与两个后台线程退出。
+- [第 8 步讲解](docs/steps/08-bloom-filter.md)：位数组、哈希、假阳性与无漏判、删除标记、重建与扫描量测量。
 - `include/kvstore/memtable.h`：MemTable 的声明。
 - `src/memtable.cpp`：MemTable 的实现。
 - `src/main.cpp`：命令行入口。
@@ -41,6 +42,8 @@
 - `tests/background_test.cpp`：可控并发交错、自动触发、异常与退出测试。
 - `src/background_flush.cpp`：冻结与 WAL 切换、后台刷盘及完成通知。
 - `tests/background_flush_test.cpp`：冻结期间查询与写入、背压、双任务交接、异常和退出。
+- `include/kvstore/bloom_filter.h`、`src/bloom_filter.cpp`：内存 Bloom filter 与容量降级。
+- `tests/bloom_filter_test.cpp`、`tests/sstable_bloom_test.cpp`：过滤器及 SSTable/Store 接入验证。
 - `CMakeLists.txt`：构建入口。
 
 现在不预建 Raft、gRPC 或缓存模块；到对应步骤再引入文件和依赖。后续代码只在这个子文件夹中开发。
@@ -79,7 +82,7 @@ All 12 MemTable tests passed.
 
 ```sh
 mkdir -p build
-c++ -std=c++17 -pthread -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp src/background_compaction.cpp src/background_flush.cpp src/main.cpp -o build/kvstore
+c++ -std=c++17 -pthread -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/bloom_filter.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp src/background_compaction.cpp src/background_flush.cpp src/main.cpp -o build/kvstore
 ./build/kvstore build/demo.wal put name Alice
 ./build/kvstore build/demo.wal get name
 ```
@@ -107,7 +110,7 @@ c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/wal_record.cpp tests/wal_
 
 ```sh
 mkdir -p build
-c++ -std=c++17 -pthread -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp src/background_compaction.cpp src/background_flush.cpp tests/store_test.cpp -o build/store_test
+c++ -std=c++17 -pthread -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/bloom_filter.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp src/background_compaction.cpp src/background_flush.cpp tests/store_test.cpp -o build/store_test
 ./build/store_test
 ```
 
@@ -117,7 +120,7 @@ c++ -std=c++17 -pthread -Wall -Wextra -Wpedantic -I include src/memtable.cpp src
 
 ```sh
 mkdir -p build
-c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/file_io.cpp tests/sstable_test.cpp -o build/sstable_test
+c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/bloom_filter.cpp src/file_io.cpp tests/sstable_test.cpp -o build/sstable_test
 ./build/sstable_test
 ```
 
@@ -129,7 +132,7 @@ c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_reco
 mkdir -p build
 c++ -std=c++17 -Wall -Wextra -Wpedantic -I include src/manifest.cpp tests/manifest_test.cpp -o build/manifest_test
 ./build/manifest_test
-c++ -std=c++17 -pthread -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp src/background_compaction.cpp src/background_flush.cpp tests/store_flush_test.cpp -o build/store_flush_test
+c++ -std=c++17 -pthread -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/bloom_filter.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp src/background_compaction.cpp src/background_flush.cpp tests/store_flush_test.cpp -o build/store_flush_test
 ./build/store_flush_test
 ```
 
@@ -139,7 +142,7 @@ c++ -std=c++17 -pthread -Wall -Wextra -Wpedantic -I include src/memtable.cpp src
 
 ```sh
 mkdir -p build
-c++ -std=c++17 -pthread -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp src/background_compaction.cpp src/background_flush.cpp tests/compaction_test.cpp -o build/compaction_test
+c++ -std=c++17 -pthread -Wall -Wextra -Wpedantic -I include src/memtable.cpp src/wal_record.cpp src/sstable.cpp src/bloom_filter.cpp src/manifest.cpp src/file_io.cpp src/compaction.cpp src/store.cpp src/background_compaction.cpp src/background_flush.cpp tests/compaction_test.cpp -o build/compaction_test
 ./build/compaction_test
 ```
 
@@ -231,7 +234,7 @@ cmake --build build --target background_test
 
 成功输出 `All 9 background tests passed.`。
 
-运行本次新增的后台刷盘测试：
+运行后台刷盘测试：
 
 ```sh
 cmake --build build --target background_flush_test
@@ -239,6 +242,16 @@ cmake --build build --target background_flush_test
 ```
 
 成功输出 `All 10 background flush tests passed.`。
+
+运行本次新增的 Bloom 测试：
+
+```sh
+cmake --build build --target bloom_filter_test sstable_bloom_test
+./build/bloom_filter_test
+./build/sstable_bloom_test
+```
+
+分别输出 `All 7 Bloom filter tests passed.` 和 `All 9 SSTable Bloom tests passed.`，同时打印固定样本误判率与扫描记录数对比。
 
 构建并运行项目程序：
 
@@ -268,7 +281,15 @@ flush 输出当前 SSTable 数量，Get 仍输出 `Alice`，此时从 SSTable �
 
 依次输出 `OK`、`Bob`、`deleted`、`<not found>`。Get 未找到时退出码为 1；Delete 未找到仍正常完成，退出码为 0。非法参数返回 2，存储错误返回 1。数据文件留在 `build/` 下，后续运行继续使用。删除标记会随刷盘进入 SSTable，避免旧值复活。
 
-这些可执行文件路径适用于当前 macOS 环境下的常规单配置构建。CMake 会从 `CMakeLists.txt` 读取头文件目录、C++ 标准和源文件依赖，构建时不需要手写 `-I` 和源文件列表。若要统一验证，可运行 `cmake --build build` 构建全部目标，再运行 `(cd build && ctest --output-on-failure)` 执行九组测试。
+这些可执行文件路径适用于当前 macOS 环境下的常规单配置构建。CMake 会从 `CMakeLists.txt` 读取头文件目录、C++ 标准和源文件依赖，构建时不需要手写 `-I` 和源文件列表。若要统一验证，可运行 `cmake --build build` 构建全部目标，再运行 `(cd build && ctest --output-on-failure)` 执行十一组测试。
+
+### Bloom filter 如何影响查询
+
+已有 Get 命令不变。每张 SSTable 打开时构建内存位数组，查询一定不存在的 key 时可直接跳过该文件。可能存在仍执行精确扫描，因此假阳性只增加工作量，不改变返回值。Value 与 Tombstone 都加入过滤器，避免跳过删除后读到旧值。
+
+过滤器按每 key 10 bit、七次探测配置，最少 8 字节，单 reader 位数组上限 8 MiB，超过则保守关闭过滤并扫描。重启仍完整校验 SSTable 并重建过滤器；CLI 每条命令启动新进程，因此不能用它直接证明重复查询的总体延迟改善。长时间打开的 Store 才能持续使用已建好的过滤器。
+
+固定样本：加入 10,000 个 key，检查无漏判；20,000 个缺失 key 的误判率为 158/20,000，即 0.79%。另一张含 128 条记录的表，200 次缺失查询跳过 199 次扫描，开启/关闭时分别解析 128/25,600 条记录。这是打开之后的逻辑扫描量，不是物理磁盘读取数或延迟 benchmark。详情见第 8 步记录。
 
 ### 合并 SSTable
 
@@ -309,11 +330,11 @@ compact 输出 `OK (1 SSTables)`，Get 输出 `Bob`；旧 SSTable 在新结果�
 
 ### 当前验证状态
 
-本机 CMake 4.4.4 和 Apple Clang 21 构建成功，九组 CTest 均通过，共 115 个测试函数：12 个 MemTable、12 个 WAL、12 个原 Store、17 个 SSTable、6 个 manifest、21 个 Store 刷盘、16 个 compaction、9 个后台合并、10 个后台刷盘测试。
+本机 CMake 4.4.4 和 Apple Clang 21 构建成功，十一组 CTest 均通过，共 131 个测试函数：12 个 MemTable、12 个 WAL、12 个原 Store、17 个 SSTable、6 个 manifest、21 个 Store 刷盘、16 个 compaction、9 个后台合并、10 个后台刷盘、7 个 Bloom filter、9 个 SSTable Bloom 接入测试。
 
-普通构建与开启编译警告、AddressSanitizer、UndefinedBehaviorSanitizer 的构建均通过完整测试。ThreadSanitizer 单独运行两组后台测试，共 19 个函数，通过且无数据竞争报告；带 fork 的故障测试不纳入这项线程检查。新增验证覆盖冻结表读写交错、背压、两个后台任务的发布顺序、两次清单发布的强杀/异常、双 WAL 校验及显式尾部处理、新 WAL 写入后的刷盘强杀恢复，以及两个线程的退出收尾。原有部分写入与模型测试继续保留。
+普通构建与开启编译警告、AddressSanitizer、UndefinedBehaviorSanitizer 的构建均通过完整测试。ThreadSanitizer 单独运行后台合并、后台刷盘、SSTable Bloom 接入三组，共 28 个函数，通过且无数据竞争报告。原有强杀、部分写入、双 WAL 恢复与模型测试保留；新增无漏判、假阳性精确回退、删除标记、空/二进制 key、重开重建、逻辑扫描量对照及并发查询验证。
 
-独立 SSTable writer 和 MergeSSTables 只负责文件构建，Store 负责同步、清单发布与回收协议。当前前台读写仍串行；冻结、发布和回收持状态锁，后台生成/校验 SSTable 和合并输出不持锁。尚无块索引、Bloom filter、block cache、Raft 或事务，未进行真实断电实验或性能测量。
+独立 SSTable writer 和 MergeSSTables 负责文件构建，Store 负责同步、清单发布与回收。过滤器在 reader 发布前构建完成，Get 仍由原状态锁保护；compaction 输入全扫描关闭无用过滤器。尚无过滤器持久化、块索引、block cache、Raft 或事务，未进行真实断电实验或延迟性能测量。
 
 所有编译输出均放在已忽略的 `build/` 目录中。
 

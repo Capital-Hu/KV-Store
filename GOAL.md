@@ -1,6 +1,6 @@
 # 最终目标与验收
 
-状态：进行中。第 7 步已完成：7a 后台 compaction，7b 后台刷盘、单冻结表背压、双 WAL 恢复及两个后台线程收尾。等待讨论和明确 OK 后，再开始第 8 步 Bloom filter。
+状态：进行中。第 8 步 Bloom filter 已完成：SSTable 打开校验时构建内存过滤器，查询负判断跳过扫描，覆盖删除标记并验证无漏判、样本误判率及扫描量。过滤器暂不持久化，重开时重建。等待讨论和明确 OK 后，再开始第 9 步块索引与 block cache。
 
 ## 必须完成的两部分
 
@@ -22,7 +22,7 @@
 - [x] 同步全量 compaction、流式读写、删除标记规则、发布和回收中断验证，见 [第 6 步记录](docs/steps/06-compaction.md)。
 - [x] 后台 compaction 及并发正确性验证，见 [第 7a 步记录](docs/steps/07a-background-compaction.md)。
 - [x] 后台刷盘：单冻结 MemTable 槽、双 WAL 恢复及自动阈值下的写入背压，见 [第 7b 步记录](docs/steps/07b-background-flush.md)。阈值不是精确堆内存上限；关闭自动阈值后由调用方控制可写表大小。
-- [ ] Bloom filter 及无假阴性的验证。
+- [x] Bloom filter 及无假阴性验证，见 [第 8 步记录](docs/steps/08-bloom-filter.md)。每次打开 SSTable 在内存重建；已测固定样本误判率和逻辑扫描量，没有物理 I/O 或延迟性能结论。
 - [ ] 有容量限制的 block cache 及淘汰行为验证。
 - [ ] 单机故障恢复集成验证。
 - [ ] Raft 选举、日志复制、持久化、状态机应用与 gRPC 通信。

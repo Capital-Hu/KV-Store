@@ -1,5 +1,7 @@
 #pragma once
 
+#include "kvstore/bloom_filter.h"
+
 #include <cstdint>
 #include <fstream>
 #include <optional>
@@ -17,6 +19,15 @@ struct SSTableEntry {
     SSTableEntryType type;
     std::string key;
     std::string value;  // Tombstones must have an empty value.
+};
+
+// Logical work for Get only; excludes opening validation and Next-based merge scans.
+// These are not physical disk-read counts: std::ifstream and the OS may buffer I/O.
+struct SSTableReadStats {
+    std::uint64_t get_calls = 0;
+    std::uint64_t bloom_negatives = 0;
+    std::uint64_t table_scans = 0;
+    std::uint64_t entries_examined = 0;
 };
 
 // Write a new file; never overwrite an existing path.
@@ -53,10 +64,11 @@ private:
 };
 
 // Single-threaded reader. The file must not be modified while it is open.
-// Opening validates the entire file; lookups scan it without loading a full table.
+// Opening validates the entire file and builds an in-memory filter, including tombstones.
+// A possible match still requires scanning; filters are rebuilt on every open.
 class SSTableReader {
 public:
-    explicit SSTableReader(const std::string& path);
+    explicit SSTableReader(const std::string& path, bool use_bloom_filter = true);
 
     SSTableReader(const SSTableReader&) = delete;
     SSTableReader& operator=(const SSTableReader&) = delete;
@@ -67,9 +79,11 @@ public:
     // A returned Value may contain an empty string; these are three distinct cases.
     std::optional<SSTableEntry> Get(const std::string& key);
     std::uint32_t size() const { return entry_count_; }
+    const SSTableReadStats& read_stats() const { return read_stats_; }
+    bool bloom_filter_enabled() const { return bloom_ && bloom_->enabled(); }
 
-    // Single shared cursor: Get also rewinds/advances it. Use separate readers
-    // for independent scans. Returned entries own their strings.
+    // A scanning Get rewinds/advances this cursor; a Bloom negative leaves it unchanged.
+    // Use separate readers for independent scans. Returned entries own their strings.
     void Rewind();
     std::optional<SSTableEntry> Next();
 
@@ -77,6 +91,8 @@ private:
     std::ifstream input_;  // Owns and closes the file through RAII.
     std::uint32_t entry_count_ = 0;
     std::uint32_t entries_read_ = 0;
+    std::optional<BloomFilter> bloom_;
+    SSTableReadStats read_stats_;
 };
 
 }  // namespace kvstore

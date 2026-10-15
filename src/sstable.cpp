@@ -149,7 +149,7 @@ void SSTableWriter::Finish() {
     }
 }
 
-SSTableReader::SSTableReader(const std::string& path) {
+SSTableReader::SSTableReader(const std::string& path, bool use_bloom_filter) {
     ValidatePath(path);
     if (!std::filesystem::is_regular_file(path)) {
         throw std::invalid_argument("SSTable must be an existing regular file");
@@ -164,12 +164,15 @@ SSTableReader::SSTableReader(const std::string& path) {
         throw std::runtime_error("Invalid SSTable format/version");
     }
     entry_count_ = ReadU32(header, 4);
+    if (use_bloom_filter) { bloom_.emplace(entry_count_); }
     std::string previous_key;
     for (std::uint32_t i = 0; i < entry_count_; ++i) {
         auto entry = ReadEntry(input_);
         if (i > 0 && !(previous_key < entry.key)) {
             throw std::runtime_error("SSTable keys are not strictly increasing");
         }
+        // A tombstone is present in this table and must never be filtered out.
+        if (bloom_) { bloom_->Add(entry.key); }
         previous_key = std::move(entry.key);
     }
     // The count catches even truncation exactly between two complete records.
@@ -195,8 +198,15 @@ std::optional<SSTableEntry> SSTableReader::Next() {
 }
 
 std::optional<SSTableEntry> SSTableReader::Get(const std::string& key) {
+    ++read_stats_.get_calls;
+    if (bloom_ && !bloom_->MayContain(key)) {
+        ++read_stats_.bloom_negatives;
+        return std::nullopt;
+    }
+    ++read_stats_.table_scans;
     Rewind();
     while (auto entry = Next()) {
+        ++read_stats_.entries_examined;
         if (entry->key == key) { return entry; }
         if (key < entry->key) { break; }
     }

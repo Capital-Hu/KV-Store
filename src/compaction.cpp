@@ -31,7 +31,8 @@ std::uint32_t MergeSSTables(const std::vector<std::string>& inputs,
     heads.reserve(inputs.size());
     // Validate all input files before creating output. Each reader has its own cursor.
     for (const auto& path : inputs) {
-        auto reader = std::make_unique<SSTableReader>(path);
+        // Full sequential scans cannot skip keys; avoid unused per-input filters.
+        auto reader = std::make_unique<SSTableReader>(path, false);
         reader->Rewind();
         heads.push_back(reader->Next());
         readers.push_back(std::move(reader));

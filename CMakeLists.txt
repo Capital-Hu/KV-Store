@@ -5,7 +5,8 @@ set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 find_package(Threads REQUIRED)
 
 add_library(kvstore_engine STATIC src/memtable.cpp src/wal_record.cpp src/store.cpp src/sstable.cpp
-    src/manifest.cpp src/file_io.cpp src/compaction.cpp src/background_compaction.cpp src/background_flush.cpp)
+    src/manifest.cpp src/file_io.cpp src/compaction.cpp src/background_compaction.cpp src/background_flush.cpp
+    src/bloom_filter.cpp)
 target_include_directories(kvstore_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(kvstore_engine PUBLIC cxx_std_17)
 target_link_libraries(kvstore_engine PUBLIC Threads::Threads)
@@ -55,4 +56,13 @@ if(BUILD_TESTING)
     target_link_libraries(background_flush_test PRIVATE kvstore_engine)
     add_test(NAME background_flush COMMAND background_flush_test)
     set_tests_properties(background_flush PROPERTIES TIMEOUT 60)
+
+    add_executable(bloom_filter_test tests/bloom_filter_test.cpp)
+    target_link_libraries(bloom_filter_test PRIVATE kvstore_engine)
+    add_test(NAME bloom_filter COMMAND bloom_filter_test)
+
+    add_executable(sstable_bloom_test tests/sstable_bloom_test.cpp)
+    target_link_libraries(sstable_bloom_test PRIVATE kvstore_engine)
+    add_test(NAME sstable_bloom COMMAND sstable_bloom_test)
+    set_tests_properties(sstable_bloom PROPERTIES TIMEOUT 60)
 endif()
