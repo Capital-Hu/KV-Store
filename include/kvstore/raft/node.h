@@ -18,6 +18,12 @@ struct ElectionOptions {
     std::optional<std::uint64_t> random_seed;  // Set in tests for repeatable timeouts.
 };
 
+// Acceptance into the leader's durable log is not a commit acknowledgement.
+struct Proposal {
+    LogIndex index;
+    Term term;
+};
+
 // An owned observation of the node, not a writable reference to its state.
 struct NodeStatus {
     NodeId id = 0;
@@ -36,7 +42,7 @@ struct NodeStatus {
 
 // Single-threaded protocol model. Its caller will serialize events.
 // Storage-backed nodes run elections; the constructor without Storage stays passive.
-// No Store, network, data replication, commitment, or background threads yet.
+// No Store, network, state-machine application, or background threads yet.
 class Node {
 public:
     explicit Node(NodeConfig config);
@@ -56,12 +62,23 @@ public:
     void AdvanceTime(std::chrono::milliseconds elapsed);
     void Step(const Message& message);
     std::vector<Message> DrainMessages();
+    Proposal Propose(Command command);
+    // Owned committed prefix after the caller's cursor; this does not apply entries.
+    std::vector<LogEntry> CommittedEntries(LogIndex after = 0) const;
 
 private:
+    struct PendingAppend {
+        std::uint64_t rpc_id;
+        AppendEntriesRequest request;
+    };
     struct Peer {
         NodeId id;
         std::uint64_t vote_rpc_id = 0;
         bool vote_granted = false;
+        LogIndex next_index = 1;
+        LogIndex match_index = 0;
+        LogIndex acknowledged_commit = 0;
+        std::optional<PendingAppend> pending = std::nullopt;
     };
     void EnsureUsable() const;
     void Fail();
@@ -71,6 +88,8 @@ private:
     void StartElection();
     void BecomeLeader();
     void SendHeartbeats();
+    void SendAppend(Peer& peer, bool retry = false);
+    void AdvanceCommit();
     std::uint64_t NextRpcId();
     void Handle(const Message& message, const RequestVoteRequest& request);
     void Handle(const Message& message, const RequestVoteResponse& response);

@@ -64,6 +64,17 @@ bool SameEntry(const LogEntry& left, const LogEntry& right) {
            left.command.key == right.command.key && left.command.value == right.command.value;
 }
 
+bool ValidCommand(const Command& command) {
+    if (command.key.size() > kMaxRaftCommandBytes ||
+        command.value.size() > kMaxRaftCommandBytes - command.key.size()) { return false; }
+    switch (command.type) {
+        case CommandType::Put: return true;
+        case CommandType::Delete: return command.value.empty();
+        case CommandType::NoOp: return command.key.empty() && command.value.empty();
+    }
+    return false;
+}
+
 std::size_t ValidateSuffix(const PersistentState& state, std::size_t log_bytes,
                            LogIndex first_index, const std::vector<LogEntry>& entries) {
     if (first_index == 0 || first_index > state.log.size() + 1) {
@@ -80,13 +91,8 @@ std::size_t ValidateSuffix(const PersistentState& state, std::size_t log_bytes,
             entry.term > state.current_term) {
             throw std::invalid_argument("Raft log indexes and terms must be ordered and match the current term bound");
         }
-        if ((command.type != CommandType::Put && command.type != CommandType::Delete) ||
-            (command.type == CommandType::Delete && !command.value.empty())) {
-            throw std::invalid_argument("Invalid Raft command");
-        }
-        if (command.key.size() > kMaxRaftCommandBytes ||
-            command.value.size() > kMaxRaftCommandBytes - command.key.size()) {
-            throw std::length_error("Raft key plus value exceeds 1 MiB");
+        if (!ValidCommand(command)) {
+            throw std::invalid_argument("Invalid Raft command or key plus value exceeds 1 MiB");
         }
         if (prefix + i < state.log.size() && state.log[prefix + i].term == entry.term &&
             !SameEntry(state.log[prefix + i], entry)) {
@@ -132,7 +138,8 @@ std::string EncodeChange(const Change& change) {
             }
             coding::AppendU64(bytes, entry.index);
             coding::AppendU64(bytes, entry.term);
-            bytes.push_back(entry.command.type == CommandType::Put ? 1 : 2);
+            bytes.push_back(entry.command.type == CommandType::Put ? 1 :
+                            entry.command.type == CommandType::Delete ? 2 : 3);
             coding::AppendU32(bytes, static_cast<std::uint32_t>(entry.command.key.size()));
             coding::AppendU32(bytes, static_cast<std::uint32_t>(entry.command.value.size()));
             bytes += entry.command.key;
@@ -161,8 +168,8 @@ Change DecodeChange(std::string_view payload) {
             LogEntry entry;
             entry.index = input.U64(); entry.term = input.U64();
             const auto type = input.U8();
-            if (type != 1 && type != 2) { throw std::runtime_error("Unknown Raft command type"); }
-            entry.command.type = type == 1 ? CommandType::Put : CommandType::Delete;
+            if (type < 1 || type > 3) { throw std::runtime_error("Unknown Raft command type"); }
+            entry.command.type = type == 1 ? CommandType::Put : type == 2 ? CommandType::Delete : CommandType::NoOp;
             const auto key_bytes = input.U32(), value_bytes = input.U32();
             if (key_bytes > kMaxRaftCommandBytes || value_bytes > kMaxRaftCommandBytes - key_bytes) {
                 throw std::runtime_error("Raft command exceeds byte limit");

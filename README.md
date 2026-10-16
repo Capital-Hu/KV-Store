@@ -2,7 +2,7 @@
 
 一个逐步实现、逐步讲解的 C++ 学习项目。先完成单机 LSM 存储引擎，再完成三节点 Raft 复制。两部分都是最终验收要求。
 
-当前完成 **第 13 步：Raft 选举、心跳和角色切换**。带 Storage 的节点通过时间事件与消息信箱完成持久化选举、周期心跳、分票重选及高任期退位；提供可运行的三节点进程内演示。尚无数据复制、提交、Store/gRPC 或客户端接入，下一步实现日志复制和提交。
+当前完成 **第 14 步：Raft 日志复制、冲突修正与提交**。Leader 先持久化提议，再向其他节点复制；多数确认且满足当前任期规则后推进提交。支持分批追赶、冲突后缀修正、重试及当选 NoOp；提供可运行的三节点进程内演示。下一步将已提交命令接入 Store，之后接 gRPC 和客户端。
 
 ## 从哪里看
 
@@ -24,6 +24,7 @@
 - [第 11 步讲解](docs/steps/11-raft-model.md)：独立 Raft 模块、初始状态、消息字段、逻辑时间与 C++ 写法。
 - [第 12 步讲解](docs/steps/12-raft-storage.md)：Raft 日志格式、任期/投票同步、后缀替换、恢复模式与故障测试。
 - [第 13 步讲解](docs/steps/13-raft-election.md)：消息信箱、随机超时、持久化选举、心跳、重选和演示。
+- [第 14 步讲解](docs/steps/14-raft-replication.md)：提议、分批复制、冲突修正、多数提交、NoOp、重启与演示。
 - [单机架构说明](docs/architecture.md)：文件职责、完整读写路径、后台工作、锁与启动恢复。
 - `include/kvstore/memtable.h`：MemTable 的声明。
 - `src/memtable.cpp`：MemTable 的实现。
@@ -55,12 +56,14 @@
 - `tests/engine_integration_test.cpp`：单机模块集成、混合操作、成功通知与进程强杀恢复。
 - `include/kvstore/raft/types.h`：Raft 角色、命令、日志条目、持久状态和消息结构。
 - `include/kvstore/raft/node.h`、`src/raft/node.cpp`：独立节点模型、状态观察与逻辑时间。
+- `src/raft/replication.cpp`：提议、按 peer 复制和重试、冲突修正及提交。
 - `tests/raft_model_test.cpp`：节点配置、初始状态、独立时钟及时间边界测试。
 - `include/kvstore/raft/storage.h`、`src/raft/storage.cpp`：独占 Raft 持久化、同步、后缀替换与重启回放。
 - `src/raft/storage_codec.h`、`src/raft/storage_codec.cpp`：内部文件格式和状态约束，不是公共网络编码。
 - `tests/raft_storage_test.cpp`：Raft 持久化、损坏/截断、进程强杀、真实部分写入及 Node 恢复。
-- `src/raft_demo.cpp`：单进程内三节点选主、隔离重选及重新打开状态的演示。
+- `src/raft_demo.cpp`：单进程内选主、复制提交、隔离重选、冲突追赶与重开的演示。
 - `tests/raft_election_test.cpp`：选举/心跳、乱序/重复/丢消息、重启与协议持久化失败验证。
+- `tests/raft_replication_test.cpp`：复制/提交规则、追赶/冲突、消息故障、持久化边界及重开验证。
 - `CMakeLists.txt`：构建入口。
 
 Raft 通过独立的 `kvstore_raft` 目标编译，不链接单机引擎；两者共用由原有 `src/file_io.cpp` 编译的低层 `kvstore_file_io`，不共享日志或 KV 状态。gRPC 到通信步骤再引入依赖。后续代码只在这个子文件夹中开发。
@@ -307,16 +310,16 @@ cmake --build build --target raft_storage_test
 
 成功输出 `All 15 Raft storage tests passed (8 process crashes and 2 real partial writes).`。只在独立临时目录中创建 Raft 数据，强杀和文件大小限制只作用于测试子进程，不影响手动使用的 Store 文件。
 
-观察本次新增的选举与重选演示（建议先运行）：
+观察 Raft 复制与提交演示（建议先运行）：
 
 ```sh
 cmake --build build --target raft_demo
 ./build/raft_demo
 ```
 
-会显示：初始 follower → 节点 1 在任期 1 当选 → 心跳保持 → 隔离节点 1 后节点 2 在任期 2 当选 → 节点 1 重开为旧任期 follower → 收到新心跳后进入任期 2。演示用逻辑时间和三份临时持久化状态，没有网络连接；结束自动清理数据。
+会显示：选出 Leader 并提交 NoOp → 本地 Put 时日志前进、提交未动 → 多数确认后提交 → 隔离的旧 Leader 无法独自提交 → 新 Leader 提交 Delete → 重连修正旧后缀 → 重开后重新确认提交位置。重点比较 `last_log_index` 和 `commit_index`。演示用逻辑时间和三份临时持久化状态，没有网络连接；结束自动清理数据。
 
-运行本次新增的 Raft 选举测试：
+运行 Raft 选举测试：
 
 ```sh
 cmake --build build --target raft_election_test
@@ -324,6 +327,15 @@ cmake --build build --target raft_election_test
 ```
 
 成功输出 `All 20 Raft election tests passed (2 persistence-boundary process crashes).`。覆盖可控交付、消息故障、日志新旧限制、任期切换及成功释放消息前的同步边界。
+
+运行本次新增的 Raft 复制测试：
+
+```sh
+cmake --build build --target raft_replication_test
+./build/raft_replication_test
+```
+
+成功输出 `All 17 Raft replication tests passed (2 persistence-boundary process crashes).`。覆盖落后追赶、冲突后缀、当前任期提交限制、少数派隔离、重开、消息故障和持久化失败。旧构建目录若提示找不到这个新目标，先执行一次上面的 CMake 配置命令，使构建规则包含新目标。
 
 构建并运行项目程序：
 
@@ -353,7 +365,7 @@ flush 输出当前 SSTable 数量，Get 仍输出 `Alice`，此时从 SSTable �
 
 依次输出 `OK`、`Bob`、`deleted`、`<not found>`。Get 未找到时退出码为 1；Delete 未找到仍正常完成，退出码为 0。非法参数返回 2，存储错误返回 1。数据文件留在 `build/` 下，后续运行继续使用。删除标记会随刷盘进入 SSTable，避免旧值复活。
 
-这些可执行文件路径适用于当前 macOS 环境下的常规单配置构建。CMake 会从 `CMakeLists.txt` 读取头文件目录、C++ 标准和源文件依赖，构建时不需要手写 `-I` 和源文件列表。若要统一验证，可运行 `cmake --build build` 构建全部目标，再运行 `ctest --test-dir build --output-on-failure` 执行十七组测试。
+这些可执行文件路径适用于当前 macOS 环境下的常规单配置构建。CMake 会从 `CMakeLists.txt` 读取头文件目录、C++ 标准和源文件依赖，构建时不需要手写 `-I` 和源文件列表。若要统一验证，可运行 `cmake --build build` 构建全部目标，再运行 `ctest --test-dir build --output-on-failure` 执行十八组测试。
 
 ### Bloom filter 如何影响查询
 
@@ -412,11 +424,11 @@ compact 输出 `OK (1 SSTables)`，Get 输出 `Bob`；旧 SSTable 在新结果�
 
 ### 当前验证状态
 
-本机 CMake 4.4.4 和 Apple Clang 21 构建成功，十七组 CTest 均通过，共 195 个测试函数：单机引擎 156 个、Raft 基础模型 4 个、持久化 15 个、选举 20 个。新增验证覆盖选举、心跳、分票、消息乱序/重复/丢弃及重开，并覆盖 2 个协议同步后、输出前的进程强杀场景。原有故障恢复测试继续通过。
+本机 CMake 4.4.4 和 Apple Clang 21 构建成功，十八组 CTest 均通过，共 212 个测试函数：单机引擎 156 个、Raft 基础模型 4 个、持久化 15 个、选举 20 个、复制 17 个。新增验证覆盖多数派提交、冲突修正、分批追赶、消息故障及重开，并覆盖 2 个日志同步后、输出前的进程强杀场景。原有故障恢复测试继续通过。
 
-普通构建与开启编译警告、AddressSanitizer、UndefinedBehaviorSanitizer 的构建均通过完整十七组测试，演示在两种构建中运行成功，完整构建无警告。第 9 步已有的五组 ThreadSanitizer 检查结果和第 10 步集成测试两个进程内场景的检查结果保留；Raft 当前仍是单线程事件模型，本轮不新增线程检查。详细场景与验证范围见第 10～13 步记录。
+普通构建与开启编译警告、AddressSanitizer、UndefinedBehaviorSanitizer 的构建均通过完整十八组测试，演示在两种构建中运行成功，最终构建无警告。第 9 步已有的五组 ThreadSanitizer 检查结果和第 10 步集成测试两个进程内场景的检查结果保留；Raft 当前仍是单线程事件模型，本轮不新增线程检查。详细场景与验证范围见第 10～14 步记录。
 
-当前前台操作仍共用 Store 状态锁，共享缓存内部另有互斥锁。Bloom 和索引均打开时重建，缓存存原始编码字节。尚无 Bloom/块索引持久化、块压缩或事务；Raft 已能进程内选举，但尚不能复制数据或处理客户端请求，未进行真实断电或吞吐量/延迟实验。
+当前前台操作仍共用 Store 状态锁，共享缓存内部另有互斥锁。Bloom 和索引均打开时重建，缓存存原始编码字节。尚无 Bloom/块索引持久化、块压缩或事务；Raft 已能进程内选举和复制提交日志，尚未执行到 Store 或接入客户端服务，未进行真实断电或吞吐量/延迟实验。
 
 ### Raft 持久化的当前边界
 
@@ -424,7 +436,7 @@ compact 输出 `OK (1 SSTables)`，Get 输出 `Bob`；旧 SSTable 在新结果�
 
 默认 Strict 模式拒绝不完整尾部。显式 TruncateIncompleteTail 只丢弃最后不完整变化，已确认的 CRC/格式损坏仍拒绝打开。当前逻辑日志最多 64 MiB 编码条目、1,000,000 条，单个 key + value 最多 1 MiB，单次变化 payload 最多 16 MiB；历史追加文件暂不压缩。Node 恢复后仍从 follower 和未提交/未执行位置开始，日志长度不等于已提交进度。完整接口、格式与限制见第 12 步。
 
-第 13 步中，带 Storage 的 Node 接受 AdvanceTime / Step 事件，用 DrainMessages 输出待发消息。超时前持久化新任期与自投票，合法赞成票达到多数后当选；收到有效高任期 RPC 会持久化并退位。当前只支持空条目、leader_commit=0 的心跳，不把数据复制或提交假装为成功。隔离旧 leader 可以暂时保留旧任期的 Leader 角色，不能据此成功处理客户端请求；目前还没有该接口。默认不带 Storage 的构造保留被动模型，消息处理要求持久化状态。
+带 Storage 的 Node 接受 AdvanceTime / Step 事件，用 DrainMessages 输出待发消息。超时前持久化新任期与自投票，合法赞成票达到多数后当选；收到有效高任期 RPC 会持久化并退位。第 14 步增加 Propose 和 CommittedEntries：Propose 返回本地日志位置与任期，不等于提交成功；只有多数确认且满足当前任期规则才推进 commit_index。隔离旧 Leader 的未提交提议可能被覆盖。每个 peer 同时等待一份请求，按心跳重试，最多 64 条、2 MiB 编码条目的批次追赶；新 Leader 追加 NoOp 确认旧前缀。NoOp 磁盘标签为 3，新程序可读原 Put/Delete 格式，旧程序不支持新标签。CommittedEntries 返回副本，不执行命令，last_applied 保持 0。默认不带 Storage 的构造保留被动模型，消息处理要求持久化状态。
 
 所有编译输出均放在已忽略的 `build/` 目录中。
 

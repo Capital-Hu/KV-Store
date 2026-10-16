@@ -108,7 +108,10 @@ void Node::ResetElectionTimer() {
 
 void Node::ClearElection() {
     outbox_.clear();
-    for (auto& peer : peers_) { peer.vote_rpc_id = 0; peer.vote_granted = false; }
+    for (auto& peer : peers_) {
+        peer.vote_rpc_id = 0; peer.vote_granted = false;
+        peer.pending.reset(); peer.next_index = 1; peer.match_index = 0; peer.acknowledged_commit = 0;
+    }
 }
 
 void Node::ObserveHigherTerm(Term term) {
@@ -150,15 +153,11 @@ void Node::BecomeLeader() {
     leader_id_ = config_.id;
     ClearElection();
     election_elapsed_ = heartbeat_elapsed_ = std::chrono::milliseconds{0};
+    const auto next = status().last_log_index + 1;
+    for (auto& peer : peers_) { peer.next_index = next; }
+    // A current-term entry lets the new leader establish the committed prefix.
+    storage_->Append({{next, status().term, {CommandType::NoOp, {}, {}}}});
     SendHeartbeats();
-}
-
-void Node::SendHeartbeats() {
-    const auto current = status();
-    for (const auto& peer : peers_) {
-        outbox_.push_back({config_.id, peer.id, NextRpcId(),
-            AppendEntriesRequest{current.term, config_.id, current.last_log_index, current.last_log_term, {}, 0}});
-    }
 }
 
 void Node::Handle(const Message& message, const RequestVoteRequest& request) {
@@ -186,31 +185,6 @@ void Node::Handle(const Message& message, const RequestVoteResponse& response) {
     const auto votes = 1 + static_cast<std::size_t>(std::count_if(peers_.begin(), peers_.end(),
         [](const Peer& value) { return value.vote_granted; }));
     if (votes >= majority_size()) { BecomeLeader(); }
-}
-
-void Node::Handle(const Message& message, const AppendEntriesRequest& request) {
-    if (request.leader_id != message.from || request.term == 0 || request.prev_log_term > request.term ||
-        ((request.prev_log_index == 0) != (request.prev_log_term == 0))) { return; }
-    ObserveHigherTerm(request.term);
-    const auto& state = persistent_state();
-    bool success = false;
-    if (request.term == state.current_term) {
-        role_ = Role::Follower;
-        leader_id_ = request.leader_id;
-        heartbeat_elapsed_ = std::chrono::milliseconds{0};
-        ClearElection();
-        ResetElectionTimer();
-        const bool prefix_matches = request.prev_log_index == 0 ||
-            (request.prev_log_index <= state.log.size() && state.log[request.prev_log_index - 1].term == request.prev_log_term);
-        // Never acknowledge an unimplemented data append or advance commit from a heartbeat.
-        success = prefix_matches && request.entries.empty() && request.leader_commit == 0;
-    }
-    outbox_.push_back({config_.id, message.from, message.rpc_id, AppendEntriesResponse{state.current_term, success}});
-}
-
-void Node::Handle(const Message&, const AppendEntriesResponse& response) {
-    ObserveHigherTerm(response.term);
-    // Replication progress and retry/backtracking belong to the next step.
 }
 
 }  // namespace kvstore::raft

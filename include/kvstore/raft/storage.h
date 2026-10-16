@@ -39,7 +39,7 @@ public:
     void SetTermAndVote(Term term, std::optional<NodeId> voted_for);
     void Append(const std::vector<LogEntry>& entries);
     // Keep [1, first_index), replace the ENTIRE suffix with entries (possibly empty).
-    // The future protocol layer must also protect its committed prefix.
+    // The protocol layer must also protect its committed prefix.
     void ReplaceSuffix(LogIndex first_index, const std::vector<LogEntry>& entries);
 
 private:

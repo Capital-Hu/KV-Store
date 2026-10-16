@@ -21,6 +21,7 @@ struct Change {
 };
 
 void ValidateConfig(const NodeConfig& config);
+bool ValidCommand(const Command& command);
 void ValidateTermAndVote(const PersistentState& state, const NodeConfig& config,
                          Term term, std::optional<NodeId> voted_for);
 std::size_t ValidateSuffix(const PersistentState& state, std::size_t log_bytes,

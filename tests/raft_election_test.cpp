@@ -159,8 +159,11 @@ public:
     void RecordLeaders() {
         for (const auto& pair : nodes) {
             const auto state = pair.second->status();
-            Check(state.commit_index == 0 && state.last_applied == 0 && pair.second->persistent_state().log.empty(),
-                  "Election-only simulation never creates or commits data");
+            Check(state.last_applied == 0 && state.commit_index <= state.last_log_index,
+                  "Election simulation does not apply state-machine commands");
+            for (const auto& entry : pair.second->persistent_state().log) {
+                Check(entry.command.type == raft::CommandType::NoOp, "Election workload only creates leader no-ops");
+            }
             if (state.role != raft::Role::Leader) { continue; }
             const auto inserted = leaders.emplace(state.term, state.id);
             Check(inserted.second || inserted.first->second == state.id, "At most one elected leader per term across history");
@@ -358,16 +361,17 @@ void TestHeartbeatPrefixChecksAndScope() {
         Check(OnlyReply<raft::AppendEntriesResponse>(*node, 2).success == test.match, "Heartbeat checks its complete prefix metadata");
         Check(node->status().election_elapsed == 0ms && node->status().leader_id == 2, "Current leader traffic refreshes the timer even while logs differ");
     }
+    Check(Read(directory.Path()) == bytes && node->persistent_state().log.size() == 3 && node->status().commit_index == 0,
+          "Empty heartbeat preserves any extra follower suffix and does not invent a commit");
     auto append = Heartbeat(2, 1, 3, 7, 2, 2);
     std::get<raft::AppendEntriesRequest>(append.body).entries.push_back({3, 3, {raft::CommandType::Put, "x", "y"}});
     node->Step(append);
-    Check(!OnlyReply<raft::AppendEntriesResponse>(*node, 2, 7).success, "Unimplemented data append is never acknowledged");
+    Check(OnlyReply<raft::AppendEntriesResponse>(*node, 2, 7).success, "Matching prefix accepts a durable data append");
     auto commit = Heartbeat(2, 1, 3, 8, 2, 2);
     std::get<raft::AppendEntriesRequest>(commit.body).leader_commit = 2;
     node->Step(commit);
-    Check(!OnlyReply<raft::AppendEntriesResponse>(*node, 2, 8).success, "Unimplemented commit progress is never acknowledged");
-    Check(Read(directory.Path()) == bytes && node->persistent_state().log.size() == 3 && node->status().commit_index == 0,
-          "Empty heartbeat preserves any extra follower suffix and does not commit data");
+    Check(OnlyReply<raft::AppendEntriesResponse>(*node, 2, 8).success && node->status().commit_index == 2,
+          "Heartbeat can convey commitment through its matching prefix");
 }
 
 void TestInvalidMessagesAreIgnored() {

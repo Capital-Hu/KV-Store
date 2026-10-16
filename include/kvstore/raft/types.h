@@ -19,13 +19,13 @@ struct NodeConfig {
 };
 
 enum class Role { Follower, Candidate, Leader };
-enum class CommandType { Put, Delete };
+enum class CommandType { Put, Delete, NoOp };
 
 // Owned bytes, independent of the storage engine and any network encoding.
 struct Command {
     CommandType type = CommandType::Put;
     std::string key;
-    std::string value;  // Empty for Delete; Put may also store an empty value.
+    std::string value;  // Empty for Delete; NoOp has empty key and value.
 };
 
 struct LogEntry {
