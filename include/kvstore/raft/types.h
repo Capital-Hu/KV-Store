@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace kvstore::raft {
@@ -41,7 +42,7 @@ struct PersistentState {
     std::vector<LogEntry> log;
 };
 
-// Message values only: no delivery, handlers, or wire format yet.
+// In-memory RPC values; the network encoding is a later step.
 struct RequestVoteRequest {
     Term term = 0;
     NodeId candidate_id = 0;
@@ -66,6 +67,17 @@ struct AppendEntriesRequest {
 struct AppendEntriesResponse {
     Term term = 0;
     bool success = false;
+};
+
+using MessageBody = std::variant<RequestVoteRequest, RequestVoteResponse,
+                                 AppendEntriesRequest, AppendEntriesResponse>;
+
+// Responses echo the request's rpc_id; transport supplies trusted peer identity.
+struct Message {
+    NodeId from = 0;
+    NodeId to = 0;
+    std::uint64_t rpc_id = 0;
+    MessageBody body;
 };
 
 }  // namespace kvstore::raft
