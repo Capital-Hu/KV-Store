@@ -4,12 +4,21 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 find_package(Threads REQUIRED)
 
+add_library(kvstore_file_io STATIC src/file_io.cpp)
+target_compile_features(kvstore_file_io PUBLIC cxx_std_17)
+
 add_library(kvstore_engine STATIC src/memtable.cpp src/wal_record.cpp src/store.cpp src/sstable.cpp
-    src/manifest.cpp src/file_io.cpp src/compaction.cpp src/background_compaction.cpp src/background_flush.cpp
+    src/manifest.cpp src/compaction.cpp src/background_compaction.cpp src/background_flush.cpp
     src/bloom_filter.cpp src/block_cache.cpp)
 target_include_directories(kvstore_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(kvstore_engine PUBLIC cxx_std_17)
 target_link_libraries(kvstore_engine PUBLIC Threads::Threads)
+target_link_libraries(kvstore_engine PRIVATE kvstore_file_io)
+
+add_library(kvstore_raft STATIC src/raft/node.cpp src/raft/storage.cpp src/raft/storage_codec.cpp)
+target_include_directories(kvstore_raft PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(kvstore_raft PUBLIC cxx_std_17)
+target_link_libraries(kvstore_raft PRIVATE kvstore_file_io)
 
 add_executable(kvstore src/main.cpp)
 target_link_libraries(kvstore PRIVATE kvstore_engine)
@@ -80,4 +89,13 @@ if(BUILD_TESTING)
     target_link_libraries(engine_integration_test PRIVATE kvstore_engine)
     add_test(NAME engine_integration COMMAND engine_integration_test)
     set_tests_properties(engine_integration PROPERTIES TIMEOUT 120)
+
+    add_executable(raft_model_test tests/raft_model_test.cpp)
+    target_link_libraries(raft_model_test PRIVATE kvstore_raft)
+    add_test(NAME raft_model COMMAND raft_model_test)
+
+    add_executable(raft_storage_test tests/raft_storage_test.cpp)
+    target_link_libraries(raft_storage_test PRIVATE kvstore_raft)
+    add_test(NAME raft_storage COMMAND raft_storage_test)
+    set_tests_properties(raft_storage PROPERTIES TIMEOUT 120)
 endif()

@@ -2,7 +2,7 @@
 
 一个逐步实现、逐步讲解的 C++ 学习项目。先完成单机 LSM 存储引擎，再完成三节点 Raft 复制。两部分都是最终验收要求。
 
-当前完成 **第 10 步：单机集成与进程故障验证**。在独立内存模型对照下检验混合读写、四层查询、后台发布与重开，并覆盖缓存开关下 38 个进程强杀场景。第一阶段的自动化验证已完成，整体项目继续进行；下一阶段先讨论 Raft，再逐步接入三节点复制。
+当前完成 **第 12 步：Raft 持久化**。独立追加日志保存任期、投票和逻辑日志变化，支持重启恢复、后缀替换、严格校验和显式不完整尾部恢复；Node 可独占接入恢复状态。尚未实现选举、复制或 Store/gRPC 接入，下一步加入选举与心跳。
 
 ## 从哪里看
 
@@ -21,6 +21,8 @@
 - [第 8 步讲解](docs/steps/08-bloom-filter.md)：位数组、哈希、假阳性与无漏判、删除标记、重建与扫描量测量。
 - [第 9 步讲解](docs/steps/09-block-index-cache.md)：逻辑块、二分索引、共享 LRU、容量计费、失效与游标。
 - [第 10 步讲解](docs/steps/10-engine-integration.md)：独立模型、成功通知、四层读取与 38 个进程强杀场景。
+- [第 11 步讲解](docs/steps/11-raft-model.md)：独立 Raft 模块、初始状态、消息字段、逻辑时间与 C++ 写法。
+- [第 12 步讲解](docs/steps/12-raft-storage.md)：Raft 日志格式、任期/投票同步、后缀替换、恢复模式与故障测试。
 - [单机架构说明](docs/architecture.md)：文件职责、完整读写路径、后台工作、锁与启动恢复。
 - `include/kvstore/memtable.h`：MemTable 的声明。
 - `src/memtable.cpp`：MemTable 的实现。
@@ -50,9 +52,15 @@
 - `include/kvstore/block_cache.h`、`src/block_cache.cpp`：线程安全共享 LRU、字节预算及缓存编号。
 - `tests/block_cache_test.cpp`、`tests/sstable_index_test.cpp`：缓存与块索引接入验证。
 - `tests/engine_integration_test.cpp`：单机模块集成、混合操作、成功通知与进程强杀恢复。
+- `include/kvstore/raft/types.h`：Raft 角色、命令、日志条目、持久状态和消息结构。
+- `include/kvstore/raft/node.h`、`src/raft/node.cpp`：独立节点模型、状态观察与逻辑时间。
+- `tests/raft_model_test.cpp`：节点配置、初始状态、独立时钟及时间边界测试。
+- `include/kvstore/raft/storage.h`、`src/raft/storage.cpp`：独占 Raft 持久化、同步、后缀替换与重启回放。
+- `src/raft/storage_codec.h`、`src/raft/storage_codec.cpp`：内部文件格式和状态约束，不是公共网络编码。
+- `tests/raft_storage_test.cpp`：Raft 持久化、损坏/截断、进程强杀、真实部分写入及 Node 恢复。
 - `CMakeLists.txt`：构建入口。
 
-Raft、gRPC 到对应步骤再引入文件和依赖。后续代码只在这个子文件夹中开发。
+Raft 通过独立的 `kvstore_raft` 目标编译，不链接单机引擎；两者共用由原有 `src/file_io.cpp` 编译的低层 `kvstore_file_io`，不共享日志或 KV 状态。gRPC 到通信步骤再引入依赖。后续代码只在这个子文件夹中开发。
 
 ## 构建和运行
 
@@ -269,7 +277,7 @@ cmake --build build --target block_cache_test sstable_index_test
 
 分别输出 `All 8 block cache tests passed.` 和 `All 12 SSTable index/cache tests passed.`。
 
-运行本次新增的单机集成测试：
+运行单机集成测试：
 
 ```sh
 cmake --build build --target engine_integration_test
@@ -277,6 +285,24 @@ cmake --build build --target engine_integration_test
 ```
 
 成功输出 `All 5 engine integration tests passed (38 process-crash scenarios).`。测试使用独立临时目录，包含正常操作和测试子进程的强杀恢复，不会修改手动使用的数据；运行时间比单个模块测试长。`--in-process` 只运行前两个场景，用于线程检查。
+
+运行 Raft 基础模型测试：
+
+```sh
+cmake --build build --target raft_model_test
+./build/raft_model_test
+```
+
+成功输出 `All 4 Raft model tests passed.`。测试只操作内存，不创建数据文件或连接网络。当前节点始终是 follower，推进时间尚不触发选举；单机 `kvstore` 命令的用法不变。
+
+运行本次新增的 Raft 持久化测试：
+
+```sh
+cmake --build build --target raft_storage_test
+./build/raft_storage_test
+```
+
+成功输出 `All 15 Raft storage tests passed (8 process crashes and 2 real partial writes).`。只在独立临时目录中创建 Raft 数据，强杀和文件大小限制只作用于测试子进程，不影响手动使用的 Store 文件。
 
 构建并运行项目程序：
 
@@ -306,7 +332,7 @@ flush 输出当前 SSTable 数量，Get 仍输出 `Alice`，此时从 SSTable �
 
 依次输出 `OK`、`Bob`、`deleted`、`<not found>`。Get 未找到时退出码为 1；Delete 未找到仍正常完成，退出码为 0。非法参数返回 2，存储错误返回 1。数据文件留在 `build/` 下，后续运行继续使用。删除标记会随刷盘进入 SSTable，避免旧值复活。
 
-这些可执行文件路径适用于当前 macOS 环境下的常规单配置构建。CMake 会从 `CMakeLists.txt` 读取头文件目录、C++ 标准和源文件依赖，构建时不需要手写 `-I` 和源文件列表。若要统一验证，可运行 `cmake --build build` 构建全部目标，再运行 `ctest --test-dir build --output-on-failure` 执行十四组测试。
+这些可执行文件路径适用于当前 macOS 环境下的常规单配置构建。CMake 会从 `CMakeLists.txt` 读取头文件目录、C++ 标准和源文件依赖，构建时不需要手写 `-I` 和源文件列表。若要统一验证，可运行 `cmake --build build` 构建全部目标，再运行 `ctest --test-dir build --output-on-failure` 执行十六组测试。
 
 ### Bloom filter 如何影响查询
 
@@ -365,11 +391,17 @@ compact 输出 `OK (1 SSTables)`，Get 输出 `Bob`；旧 SSTable 在新结果�
 
 ### 当前验证状态
 
-本机 CMake 4.4.4 和 Apple Clang 21 构建成功，十四组 CTest 均通过，共 156 个测试函数：保留第 9 步的 151 个，新增 5 个单机集成测试。新增测试覆盖 2160 次生成混合操作及额外检查，并在缓存关闭/8 KiB 两种配置下验证 38 个进程强杀场景。
+本机 CMake 4.4.4 和 Apple Clang 21 构建成功，十六组 CTest 均通过，共 175 个测试函数：单机引擎 156 个、Raft 基础模型 4 个、Raft 持久化 15 个。新增验证覆盖两类记录的逐字节截断、8 个进程强杀场景及 2 次真实部分写入。单机集成的混合操作与 38 个进程强杀场景继续通过。
 
-普通构建与开启编译警告、AddressSanitizer、UndefinedBehaviorSanitizer 的构建均通过完整测试。第 9 步已有的五组 ThreadSanitizer 检查结果保留，本轮另对新增集成测试的两个进程内场景运行 ThreadSanitizer，通过且无数据竞争报告。进程强杀场景在普通构建和 AddressSanitizer/UndefinedBehaviorSanitizer 构建中验证；原有损坏、真实部分写入、双 WAL、缓存和索引测试继续通过。详细场景与验证范围见第 10 步记录。
+普通构建与开启编译警告、AddressSanitizer、UndefinedBehaviorSanitizer 的构建均通过完整十六组测试，构建无警告。第 9 步已有的五组 ThreadSanitizer 检查结果和第 10 步集成测试两个进程内场景的检查结果保留；Raft 当前仍是单线程模型，本轮不新增线程检查。详细场景与验证范围见第 10～12 步记录。
 
-当前前台操作仍共用 Store 状态锁，共享缓存内部另有互斥锁。Bloom 和索引均打开时重建，缓存存原始编码字节。尚无 Bloom/块索引持久化、块压缩、Raft 或事务，未进行真实断电或吞吐量/延迟实验。
+当前前台操作仍共用 Store 状态锁，共享缓存内部另有互斥锁。Bloom 和索引均打开时重建，缓存存原始编码字节。尚无 Bloom/块索引持久化、块压缩或事务；Raft 尚不能选举、复制或处理客户端请求，未进行真实断电或吞吐量/延迟实验。
+
+### Raft 持久化的当前边界
+
+每个节点独立使用 `.raft`、`.raft.lock`，`.tmp` 只用于首次发布文件头。CreateNew 仅用于未使用的新路径，OpenExisting 要求数据和锁文件存在；不因文件丢失自动重置任期。每次变化以带头部和 payload 校验的完整记录追加，先同步后更新内存，开始写入后的错误会使该 Storage 停止服务。
+
+默认 Strict 模式拒绝不完整尾部。显式 TruncateIncompleteTail 只丢弃最后不完整变化，已确认的 CRC/格式损坏仍拒绝打开。当前逻辑日志最多 64 MiB 编码条目、1,000,000 条，单个 key + value 最多 1 MiB，单次变化 payload 最多 16 MiB；历史追加文件暂不压缩。Node 恢复后仍从 follower 和未提交/未执行位置开始，日志长度不等于已提交进度。完整接口、格式与限制见第 12 步。
 
 所有编译输出均放在已忽略的 `build/` 目录中。
 
