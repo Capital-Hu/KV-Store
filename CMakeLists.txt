@@ -20,11 +20,19 @@ target_include_directories(kvstore_raft PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/incl
 target_compile_features(kvstore_raft PUBLIC cxx_std_17)
 target_link_libraries(kvstore_raft PRIVATE kvstore_file_io)
 
+add_library(kvstore_replica STATIC src/replicated_store.cpp src/replica_checkpoint.cpp)
+target_include_directories(kvstore_replica PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(kvstore_replica PUBLIC cxx_std_17)
+target_link_libraries(kvstore_replica PUBLIC kvstore_raft kvstore_engine PRIVATE kvstore_file_io)
+
 add_executable(kvstore src/main.cpp)
 target_link_libraries(kvstore PRIVATE kvstore_engine)
 
 add_executable(raft_demo src/raft_demo.cpp)
 target_link_libraries(raft_demo PRIVATE kvstore_raft)
+
+add_executable(replica_demo src/replica_demo.cpp)
+target_link_libraries(replica_demo PRIVATE kvstore_replica)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -111,4 +119,9 @@ if(BUILD_TESTING)
     target_link_libraries(raft_replication_test PRIVATE kvstore_raft)
     add_test(NAME raft_replication COMMAND raft_replication_test)
     set_tests_properties(raft_replication PROPERTIES TIMEOUT 120)
+
+    add_executable(replicated_store_test tests/replicated_store_test.cpp)
+    target_link_libraries(replicated_store_test PRIVATE kvstore_replica)
+    add_test(NAME replicated_store COMMAND replicated_store_test)
+    set_tests_properties(replicated_store PROPERTIES TIMEOUT 120)
 endif()

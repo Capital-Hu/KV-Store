@@ -2,6 +2,8 @@
 
 本轮让三个 Raft 节点复制 Put/Delete 日志，并确认哪些日志已提交。仍然是单线程事件模型、三个对象和三份独立磁盘文件。下一步才把已提交命令交给 Store 执行；本轮 `last_applied` 保持 0。
 
+本文件保留第 14 步交付范围；第 15 步已新增 ReplicatedStore 和 replica_demo 来执行到实际 Store，见 [第 15 步说明](15-raft-store.md)。原 raft_demo 仍保留纯协议演示。
+
 ## 先运行，再看代码
 
 在项目根目录执行：

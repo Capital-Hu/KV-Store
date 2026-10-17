@@ -42,11 +42,13 @@ struct NodeStatus {
 
 // Single-threaded protocol model. Its caller will serialize events.
 // Storage-backed nodes run elections; the constructor without Storage stays passive.
-// No Store, network, state-machine application, or background threads yet.
+// State-machine I/O belongs to its caller; no Store, network, or worker threads.
 class Node {
 public:
     explicit Node(NodeConfig config);
-    Node(NodeConfig config, std::unique_ptr<Storage> storage, ElectionOptions options = {});
+    // recovered_commit must come from validated durable commit metadata, never log length.
+    Node(NodeConfig config, std::unique_ptr<Storage> storage, ElectionOptions options = {},
+         LogIndex recovered_commit = 0);
     ~Node();
     Node(const Node&) = delete;
     Node& operator=(const Node&) = delete;
@@ -65,6 +67,8 @@ public:
     Proposal Propose(Command command);
     // Owned committed prefix after the caller's cursor; this does not apply entries.
     std::vector<LogEntry> CommittedEntries(LogIndex after = 0) const;
+    // Acknowledge exactly the next entry, only after successful state-machine application.
+    void MarkApplied(LogIndex index);
 
 private:
     struct PendingAppend {

@@ -11,13 +11,17 @@ namespace kvstore::raft {
 
 Node::Node(NodeConfig config) : Node(std::move(config), {}) {}
 
-Node::Node(NodeConfig config, std::unique_ptr<Storage> storage, ElectionOptions options)
+Node::Node(NodeConfig config, std::unique_ptr<Storage> storage, ElectionOptions options, LogIndex recovered_commit)
     : config_(std::move(config)), storage_(std::move(storage)), options_(options) {
     detail::ValidateConfig(config_);
     if (options_.heartbeat_interval.count() <= 0 || options_.election_timeout_min <= options_.heartbeat_interval ||
         options_.election_timeout_max < options_.election_timeout_min) {
         throw std::invalid_argument("Election timeout must exceed a positive heartbeat interval");
     }
+    if ((!storage_ && recovered_commit != 0) || (storage_ && recovered_commit > storage_->state().log.size())) {
+        throw std::invalid_argument("Recovered commit must be within the durable Raft log");
+    }
+    commit_index_ = recovered_commit;
     if (storage_) {
         auto peers = config_.peers, stored_peers = storage_->config().peers;
         std::sort(peers.begin(), peers.end()); std::sort(stored_peers.begin(), stored_peers.end());
@@ -36,6 +40,14 @@ Node::Node(NodeConfig config, std::unique_ptr<Storage> storage, ElectionOptions 
 }
 
 Node::~Node() = default;
+
+void Node::MarkApplied(LogIndex index) {
+    EnsureUsable();
+    if (index != last_applied_ + 1 || index > commit_index_) {
+        throw std::invalid_argument("Application must acknowledge the next committed entry");
+    }
+    last_applied_ = index;
+}
 
 const PersistentState& Node::persistent_state() const {
     EnsureUsable();
