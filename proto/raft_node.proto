@@ -1,0 +1,97 @@
+syntax = "proto3";
+package kvstore.wire;
+
+message Empty {
+}
+enum Operation {
+  OP_UNSPECIFIED = 0;
+  PUT = 1;
+  DELETE = 2;
+  NO_OP = 3;
+}
+message Command {
+  Operation operation = 1;
+  bytes key = 2;
+  bytes value = 3;
+}
+message Entry {
+  uint64 index = 1;
+  uint64 term = 2;
+  Command command = 3;
+}
+message VoteRequest {
+  uint64 term = 1;
+  uint64 candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+message VoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+message AppendRequest {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated Entry entries = 5;
+  uint64 leader_commit = 6;
+}
+message AppendResponse {
+  uint64 term = 1;
+  bool success = 2;
+}
+message Envelope {
+  uint64 from = 1;
+  uint64 to = 2;
+  uint64 rpc_id = 3;
+  oneof body {
+    VoteRequest vote_request = 4;
+    VoteResponse vote_response = 5;
+    AppendRequest append_request = 6;
+    AppendResponse append_response = 7;
+  }
+}
+
+// Empty acknowledges transport delivery; Raft responses travel as separate envelopes.
+service RaftTransport {
+  rpc Deliver(Envelope) returns (Empty);
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  FOLLOWER = 1;
+  CANDIDATE = 2;
+  LEADER = 3;
+}
+message NodeStatus {
+  uint64 id = 1;
+  Role role = 2;
+  uint64 term = 3;
+  uint64 leader_id = 4; // Zero means unknown.
+  uint64 last_log_index = 5;
+  uint64 commit_index = 6;
+  uint64 last_applied = 7;
+}
+message Proposal {
+  uint64 index = 1;
+  uint64 term = 2;
+}
+message GetRequest {
+  bytes key = 1;
+}
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+message AppliedResponse {
+  bool applied = 1;
+}
+
+// Diagnostic access for this stage; no leader discovery, retries or consistent reads.
+service NodeAdmin {
+  rpc Inspect(Empty) returns (NodeStatus);
+  rpc Propose(Command) returns (Proposal);
+  rpc LocalGet(GetRequest) returns (GetResponse);
+  rpc Applied(Proposal) returns (AppliedResponse);
+}

@@ -2,6 +2,8 @@
 
 这一步接通之前独立开发的两部分：Raft 确认命令顺序和提交位置，Store 执行命令并提供实际 KV 数据。新增的 ReplicatedStore 负责协调两者；Raft 库本身仍不依赖 Store。
 
+本文件保留第 15 步交付范围。第 16 步已用网络运行层串行调用 ReplicatedStore，支持本机三个独立进程，见 [第 16 步说明](16-grpc-processes.md)；replica_demo 继续保留进程内演示。
+
 ## 先运行演示
 
 在项目根目录执行：
