@@ -118,6 +118,17 @@ if(KVSTORE_BUILD_GRPC)
     set_tests_properties(cluster_fault PROPERTIES TIMEOUT 240)
 endif()
 
+if(KVSTORE_BUILD_BENCHMARKS)
+    add_executable(benchmark_workload_test benchmark/workload_test.cpp)
+    target_include_directories(benchmark_workload_test PRIVATE "${PROJECT_SOURCE_DIR}/benchmarks")
+    target_compile_features(benchmark_workload_test PRIVATE cxx_std_17)
+    add_test(NAME benchmark_workload COMMAND benchmark_workload_test)
+    find_package(Python3 3.9 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME benchmark_smoke COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/smoke_test.py" "${PROJECT_BINARY_DIR}")
+    set_tests_properties(benchmark_smoke PROPERTIES TIMEOUT 90)
+endif()
+
 # Keep the working directory used before the test sources were grouped by module.
 get_property(project_tests DIRECTORY PROPERTY TESTS)
 set_tests_properties(${project_tests} PROPERTIES WORKING_DIRECTORY "${PROJECT_BINARY_DIR}")

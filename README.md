@@ -4,9 +4,9 @@
 
 A persistent key-value store written in C++17, combining an LSM storage engine with three-node Raft replication over gRPC. Each node runs as an independent process and stores its own copy of the data.
 
-The project implements the storage and consensus layers directly, including WAL recovery, immutable SSTables, background flush and compaction, leader election, log replication, and committed-command application. It is a systems learning project under active development. The local three-node cluster includes a client library and CLI with commit-confirmed writes, log-barrier reads, leader discovery, and explicit handling of uncertain write outcomes. A local fault matrix exercises partitions, message loss/delay/duplication/reordering, and crash recovery. Performance benchmarks are planned.
+The project implements the storage and consensus layers directly, including WAL recovery, immutable SSTables, background flush and compaction, leader election, log replication, and committed-command application. The local three-node cluster includes a client library and CLI with commit-confirmed writes, log-barrier reads, leader discovery, and explicit handling of uncertain write outcomes. A local fault matrix exercises partitions, message loss/delay/duplication/reordering, and crash recovery. A reproducible mixed-workload benchmark records end-to-end throughput and P50/P95/P99 latency. This is a systems learning project; the current scope and measurement limits are documented below.
 
-[Features](#features) · [Architecture](#architecture) · [Build and run](#build-and-run-locally) · [Testing](#testing) · [Scope](#scope-and-next-work)
+[Features](#features) · [Architecture](#architecture) · [Build and run](#build-and-run-locally) · [Testing](#testing) · [Benchmark](#benchmark) · [Scope](#scope-and-next-work)
 
 ## Features
 
@@ -230,7 +230,7 @@ ctest --test-dir build/network -R '^(grpc_.*|client_process|cluster_fault)$' --o
 
 The current builds contain 19 and 23 CTest groups respectively. Coverage includes record corruption and truncation, WAL replay, manifest publication, tombstones, background-task interleavings, indexes and caching, Raft elections and conflict resolution, committed application, and process crashes. Network tests cover real KV replication, leader termination and re-election, node restart and catch-up, invalid RPCs, concurrent administration calls, and shutdown. Client tests additionally cover commit acknowledgements, quorum loss, read barriers, safe redirection, lost replies after real commits, and uncertain CLI outcomes. The seven cluster fault scenarios additionally cover live-leader isolation, follower isolation, one-way loss, complete partition, two mixed message schedules, combined crash/restart, and route validation. Tests create their own temporary data; network tests require permission to bind loopback ports and spawn child processes.
 
-Both the ordinary and AddressSanitizer/UndefinedBehaviorSanitizer network builds have passed the full suite. Latest validation results and instrumentation limits are recorded in the [cluster fault notes](docs/steps/18-cluster-faults.md#验证结果与范围). The earlier [directory reorganization](docs/steps/16a-project-layout.md) also records the thread checks and fresh-build verification performed at that stage. Test duration is not a throughput or latency benchmark.
+The benchmark-enabled Release and AddressSanitizer/UndefinedBehaviorSanitizer builds have passed the full 25-group suite, including the original 23 groups. Latest validation results and instrumentation limits are recorded in the [benchmark notes](docs/steps/19-benchmark.md#自动化回归); the [fault notes](docs/steps/18-cluster-faults.md#验证结果与范围) describe the message-fault matrix. The earlier [directory reorganization](docs/steps/16a-project-layout.md) also records the thread checks and fresh-build verification performed at that stage. Test duration is not a throughput or latency benchmark.
 
 To run the fault matrix alone, with scenario progress and message counters:
 
@@ -239,6 +239,22 @@ ctest --test-dir build/network -R '^cluster_fault$' -V --output-on-failure
 ```
 
 It automatically starts three node processes and test-only forwarding endpoints on temporary ports, then cleans them up. Nodes optionally accept `--raft-routes MEMBERS` to route outbound Raft traffic through proxies; their listening and client addresses still come from `--members`. Normal startup needs no routing override. The fault scheduler is compiled only into the test executable.
+
+## Benchmark
+
+Build the optional benchmark separately in Release mode, using the same local dependencies:
+
+```sh
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DKVSTORE_BUILD_GRPC=ON -DKVSTORE_BUILD_BENCHMARKS=ON -DBUILD_TESTING=ON -DCMAKE_PREFIX_PATH="$PWD/build/deps/install"
+cmake --build build/release
+python3 scripts/benchmark.py --build-dir build/release
+```
+
+The Python 3.9+ runner uses only the standard library. It starts a fresh three-node cluster for each run, preloads 256 keys, warms up with 128 requests, then measures 1000 requests through persistent C++ clients. Defaults cover 95% Get / 5% Put and 50% Get / 40% Put / 10% Delete at concurrency 1 and 4, with three repetitions each. No manual node startup is needed.
+
+The command prints the report location under `build/benchmark-results/`. Reports retain every run, raw request latencies, outcome counts, per-operation statistics, build and machine information, and node logs/data. Existing output directories are protected from overwrite. The benchmark-enabled test build adds `benchmark_workload` and `benchmark_smoke`, for 25 CTest groups; the other build configurations keep their existing counts.
+
+Throughput counts successful operations per measured wall-clock second. Latency covers each complete Client call, including leader discovery and the fresh NoOp barrier for reads. This is a closed-loop, small working-set benchmark on one machine, with no fixed arrival rate or large-SSTable/cache claim. See the [methodology](docs/steps/19-benchmark.md) and [recorded local results](docs/benchmarks/step19-local.md) for parameters, individual runs, and limits. Run performance measurements after other builds/tests finish.
 
 ## Project layout
 
@@ -251,9 +267,10 @@ src/rpc/            gRPC runtime, client, codec, configuration, and optional CMa
 src/common/         Internal file I/O and byte-encoding helpers
 apps/               kvstore, kvnode, kvadmin, and kvclient entry points
 examples/           In-process Raft and replicated Store demos
+benchmarks/         Optional persistent-client workload and accounting helpers
 proto/              Protobuf message and service definitions
-tests/              Tests grouped into engine/, raft/, replica/, and rpc/
-scripts/            Project-local dependency build
+tests/              Engine, Raft, replica, RPC, and benchmark workflow tests
+scripts/            Project-local dependency build and benchmark orchestration
 docs/              Architecture and implementation walkthroughs (Chinese)
 ```
 
@@ -265,10 +282,11 @@ The root `CMakeLists.txt` defines the core libraries, applications, and demos. E
 - The client implements consistent reads and commit-confirmed writes. Reads append NoOps; there is no request deduplication, automatic replay of uncertain writes, or exactly-once guarantee.
 - Transactions, MVCC, snapshots, Raft log truncation, and leveled compaction are not implemented. Store compaction reclaims SSTables; it does not compact the Raft log.
 - SSTable Bloom filters and block indexes are rebuilt in memory when tables open. Foreground Store operations currently share a coarse mutex, and writes synchronize the WAL individually.
-- A finite local fault matrix now covers partitions, one-way loss, delayed/duplicated/reordered envelopes, crash recovery, and convergence. It is not an exhaustive history checker or a simulation of every TCP failure. Reproducible mixed-workload throughput and P50/P95/P99 benchmarks remain planned; no performance figures are claimed.
+- A finite local fault matrix covers partitions, one-way loss, delayed/duplicated/reordered envelopes, crash recovery, and convergence. It is not an exhaustive history checker or a simulation of every TCP failure. Benchmarks record finite local mixed workloads; large datasets, cold caches, long-running compaction, and fixed-arrival-rate capacity remain unmeasured.
 
 ## Further reading
 
+- [Benchmark methodology](docs/steps/19-benchmark.md) and [local results](docs/benchmarks/step19-local.md): workload, timing, raw samples, and interpretation.
 - [Cluster fault matrix](docs/steps/18-cluster-faults.md): forwarding, scenarios, correctness checks, and validation limits.
 - [Client semantics and usage](docs/steps/17-client-semantics.md): leader discovery, write outcomes, consistent reads, and retries.
 - [System architecture](docs/architecture.md): module boundaries, replicated writes, persistence, and threads.

@@ -4,9 +4,9 @@
 
 一个使用 C++17 实现的持久化键值存储，将 LSM 存储引擎与基于 gRPC 的三节点 Raft 复制结合起来。每个节点作为独立进程运行，保存自己的数据副本。
 
-项目直接实现存储与共识的核心逻辑，包括 WAL 恢复、不可变 SSTable、后台刷盘与合并、选主、日志复制及已提交命令的执行。目前本机三节点集群已可运行，包含客户端库和命令行工具，提供提交确认、一致性读屏障、Leader 发现及明确的写入未知结果语义。本机故障矩阵已覆盖分区、消息丢失／延迟／重复／乱序及崩溃恢复；项目仍在开发中，后续将补充性能测试。
+项目直接实现存储与共识的核心逻辑，包括 WAL 恢复、不可变 SSTable、后台刷盘与合并、选主、日志复制及已提交命令的执行。目前本机三节点集群已可运行，包含客户端库和命令行工具，提供提交确认、一致性读屏障、Leader 发现及明确的写入未知结果语义。本机故障矩阵已覆盖分区、消息丢失／延迟／重复／乱序及崩溃恢复；可复现混合负载 benchmark 记录完整调用的吞吐量与 P50/P95/P99 延迟。这是一个系统学习项目，当前范围和测量限制见下文。
 
-[功能](#功能) · [架构](#架构) · [构建与运行](#构建与本地运行) · [测试](#测试) · [当前范围](#当前范围与后续工作)
+[功能](#功能) · [架构](#架构) · [构建与运行](#构建与本地运行) · [测试](#测试) · [性能测量](#性能测量) · [当前范围](#当前范围与后续工作)
 
 ## 功能
 
@@ -230,7 +230,7 @@ ctest --test-dir build/network -R '^(grpc_.*|client_process|cluster_fault)$' --o
 
 当前两种构建分别包含 19 和 23 组 CTest。覆盖记录损坏与截断、WAL 回放、manifest 发布、删除标记、后台任务交错、索引和缓存、Raft 选举与冲突修正、提交执行及进程崩溃。网络测试覆盖真实 KV 复制、Leader 被终止后重选、节点重启追赶、非法 RPC、并发管理调用及关闭。客户端测试还覆盖提交确认、失去多数派、读屏障、安全重定向、实际提交后的回复丢失及 CLI 未知结果。七类集群故障场景进一步覆盖存活 Leader 隔离、Follower 隔离、单向丢失、完全分区、两种混合消息序列、崩溃／重启组合及路由校验。测试使用独立临时数据；网络测试需要允许绑定回环端口和启动子进程。
 
-普通网络构建和 AddressSanitizer/UndefinedBehaviorSanitizer 构建均已通过完整测试。最新验证记录和插桩范围见[集群故障说明](docs/steps/18-cluster-faults.md#验证结果与范围)。此前[目录整理](docs/steps/16a-project-layout.md)记录了当时完成的线程检查和全新目录构建验证。测试耗时不等于吞吐量或延迟 benchmark。
+启用 benchmark 的 Release 和 AddressSanitizer/UndefinedBehaviorSanitizer 构建均已通过全部 25 组测试，包含原有 23 组。最新验证记录和插桩范围见[benchmark 说明](docs/steps/19-benchmark.md#自动化回归)，消息故障矩阵见[集群故障说明](docs/steps/18-cluster-faults.md#验证结果与范围)。此前[目录整理](docs/steps/16a-project-layout.md)记录了当时完成的线程检查和全新目录构建验证。测试耗时不等于吞吐量或延迟 benchmark。
 
 单独运行故障矩阵，并显示场景进度及消息计数：
 
@@ -239,6 +239,22 @@ ctest --test-dir build/network -R '^cluster_fault$' -V --output-on-failure
 ```
 
 测试会自动选择临时端口，启动三个节点进程与测试转发器，再清理它们。节点可通过 `--raft-routes MEMBERS` 将出站 Raft 消息发给代理；监听和客户端地址仍由 `--members` 指定。正常启动无需路由覆盖。故障调度器只编译到测试程序中。
+
+## 性能测量
+
+使用同一份本地依赖，单独创建 Release 性能构建，启用可选 benchmark：
+
+```sh
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DKVSTORE_BUILD_GRPC=ON -DKVSTORE_BUILD_BENCHMARKS=ON -DBUILD_TESTING=ON -DCMAKE_PREFIX_PATH="$PWD/build/deps/install"
+cmake --build build/release
+python3 scripts/benchmark.py --build-dir build/release
+```
+
+运行脚本需要 Python 3.9 或更新版本，只使用标准库。每轮自动启动全新的三节点集群，预装 256 个 key、预热 128 条请求，再用持续运行的 C++ Client 测量 1000 条请求。默认负载为 95% Get / 5% Put 和 50% Get / 40% Put / 10% Delete，各自使用并发 1、4，每种组合重复三次，无需手动启动节点。
+
+命令最后打印 `build/benchmark-results/` 下的报告位置。报告保留每轮结果、逐条延迟、结果计数、各操作统计、构建与机器信息，以及节点日志和数据；不会覆盖已有输出目录。启用 benchmark 的测试构建新增 `benchmark_workload` 和 `benchmark_smoke`，共 25 组 CTest，其他构建配置的测试数量不变。
+
+吞吐量按正式总时间内的成功调用数计算；延迟包含完整 Client 调用、Leader 发现和读取的新 NoOp 屏障。这是单台机器、小工作集的闭环测试，没有固定到达速率，也不代表大 SSTable 或缓存性能。参数、逐轮结果和解释范围见[测量方法](docs/steps/19-benchmark.md)与[本机实测记录](docs/benchmarks/step19-local.md)。正式测量应在其他构建和测试结束后单独运行。
 
 ## 项目结构
 
@@ -251,9 +267,10 @@ src/rpc/            gRPC 运行层、客户端、编解码、配置和可选构�
 src/common/         内部文件操作和字节编码工具
 apps/               kvstore、kvnode、kvadmin、kvclient 的程序入口
 examples/           进程内的 Raft 和复制存储演示
+benchmarks/         可选的持久客户端负载与统计工具
 proto/              Protobuf 消息和服务定义
-tests/              按 engine/、raft/、replica/、rpc/ 分组的测试
-scripts/            项目内依赖构建脚本
+tests/              存储、Raft、复制、RPC 和 benchmark 流程测试
+scripts/            项目内依赖构建与性能测试编排
 docs/               架构说明和逐步实现讲解，使用中文
 ```
 
@@ -265,10 +282,11 @@ docs/               架构说明和逐步实现讲解，使用中文
 - 客户端已提供一致性读取和提交确认。每次读取追加 NoOp；暂不提供请求去重、不确定写入的自动重放或 exactly-once 保证。
 - 暂无事务、MVCC、快照、Raft 日志截断及分层合并。Store 的 compaction 回收 SSTable，不负责压缩 Raft 日志。
 - SSTable 的 Bloom 过滤器和块索引在打开文件时重建到内存。Store 的前台操作目前共用一把较大粒度的锁，每条写入单独同步 WAL。
-- 本机有限故障矩阵已覆盖分区、单向丢失、消息延迟／重复／乱序、崩溃恢复和数据收敛；它不是穷尽所有历史的检查器，也不模拟 TCP 的每一种故障。可复现的混合负载吞吐量及 P50/P95/P99 延迟测试仍在计划中，目前不提供性能数字。
+- 本机有限故障矩阵覆盖分区、单向丢失、消息延迟／重复／乱序、崩溃恢复和数据收敛；它不是穷尽所有历史的检查器，也不模拟 TCP 的每一种故障。benchmark 记录本机有限混合负载；大数据集、冷缓存、长期合并和固定到达速率下的容量尚未测量。
 
 ## 延伸阅读
 
+- [Benchmark 测量方法](docs/steps/19-benchmark.md)与[本机结果](docs/benchmarks/step19-local.md)：负载、计时、逐条样本与解释范围。
 - [集群故障矩阵](docs/steps/18-cluster-faults.md)：转发机制、场景、正确性检查和验证范围。
 - [客户端语义与使用](docs/steps/17-client-semantics.md)：Leader 发现、写入结果、一致性读取与重试。
 - [总体架构](docs/architecture.md)：模块职责、复制写入、持久化与线程。
