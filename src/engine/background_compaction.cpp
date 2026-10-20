@@ -1,6 +1,6 @@
 #include "kvstore/store.h"
 #include "kvstore/compaction.h"
-#include "file_io.h"
+#include "common/file_io.h"
 
 #include <algorithm>
 #include <limits>

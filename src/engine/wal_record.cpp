@@ -1,5 +1,5 @@
 #include "kvstore/wal_record.h"
-#include "coding.h"
+#include "common/coding.h"
 
 #include <stdexcept>
 

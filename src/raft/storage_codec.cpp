@@ -1,5 +1,5 @@
 #include "storage_codec.h"
-#include "../coding.h"
+#include "common/coding.h"
 
 #include <algorithm>
 #include <stdexcept>

@@ -213,22 +213,26 @@ ctest --test-dir build/network -R '^grpc_' --output-on-failure
 
 The current builds contain 19 and 21 CTest groups respectively. Coverage includes record corruption and truncation, WAL replay, manifest publication, tombstones, background-task interleavings, indexes and caching, Raft elections and conflict resolution, committed application, and process crashes. Network tests cover real KV replication, leader termination and re-election, node restart and catch-up, invalid RPCs, concurrent administration calls, and shutdown. Tests create their own temporary data; network tests require permission to bind loopback ports and spawn child processes.
 
-Both the ordinary and AddressSanitizer/UndefinedBehaviorSanitizer network builds have passed the full suite. Validation details and instrumentation limits are recorded in the [network implementation notes](docs/steps/16-grpc-processes.md#验证入口). Test duration is not a throughput or latency benchmark.
+Both the ordinary and AddressSanitizer/UndefinedBehaviorSanitizer network builds have passed the full suite. Validation details and instrumentation limits are recorded in the [network implementation notes](docs/steps/16-grpc-processes.md#验证入口). The complete suites were rerun after the [directory reorganization](docs/steps/16a-project-layout.md), together with the existing thread checks and a fresh build. Test duration is not a throughput or latency benchmark.
 
 ## Project layout
 
 ```text
 include/kvstore/     Public engine, Raft, replication, and RPC interfaces
-src/                LSM engine, persistence helpers, replication coordinator, CLI
+src/engine/         LSM engine, local recovery, background flush and compaction
 src/raft/           Raft state machine, replication, and persistent log
-src/rpc/            gRPC runtime, codec, node/admin programs, optional CMake rules
+src/replica/        Raft-to-Store coordinator and commit checkpoint
+src/rpc/            gRPC runtime, codec, configuration, and optional CMake rules
+src/common/         Internal file I/O and byte-encoding helpers
+apps/               kvstore, kvnode, and kvadmin entry points
+examples/           In-process Raft and replicated Store demos
 proto/              Protobuf message and service definitions
-tests/              Unit, integration, concurrency, and process-crash tests
+tests/              Tests grouped into engine/, raft/, replica/, and rpc/
 scripts/            Project-local dependency build
 docs/              Architecture and implementation walkthroughs (Chinese)
 ```
 
-The root `CMakeLists.txt` builds the engine, Raft, and demos. Enabling `KVSTORE_BUILD_GRPC` also loads `src/rpc/CMakeLists.txt` in the same build. Generated Protobuf files stay under `build/network/src/rpc/generated/`; do not edit them. For IDE header resolution, use the network build's `compile_commands.json`, which includes the generated and dependency include directories.
+The root `CMakeLists.txt` defines the core libraries, applications, and demos. Enabling `KVSTORE_BUILD_GRPC` also loads `src/rpc/CMakeLists.txt`; enabling tests loads `tests/CMakeLists.txt`, all within the same build. Executables keep their existing paths at the build-directory root. Generated Protobuf files stay under `build/network/src/rpc/generated/`; do not edit them. For IDE header resolution, use the network build's `compile_commands.json`, which includes the generated and dependency include directories.
 
 ## Scope and next work
 
@@ -240,7 +244,9 @@ The root `CMakeLists.txt` builds the engine, Raft, and demos. Enabling `KVSTORE_
 
 ## Further reading
 
-- [Storage architecture](docs/architecture.md): local read/write paths, file lifecycle, locking, and recovery.
+- [System architecture](docs/architecture.md): module boundaries, replicated writes, persistence, and threads.
+- [Storage architecture](docs/storage-engine.md): local read/write paths, file lifecycle, locking, and recovery.
+- [Directory reorganization](docs/steps/16a-project-layout.md): old-to-new paths and regression results.
 - [Raft and Store integration](docs/steps/15-raft-store.md): committed application and restart recovery.
 - [gRPC runtime and three-process operation](docs/steps/16-grpc-processes.md): transport, threads, configuration, and failure handling.
 - [Roadmap](ROADMAP.md) and [completion criteria](GOAL.md): implementation sequence and remaining work.

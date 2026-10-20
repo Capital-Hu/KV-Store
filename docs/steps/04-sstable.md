@@ -1,5 +1,7 @@
 # 第 4 步：独立 SSTable 文件读写
 
+> 路径说明：本文记录本步骤完成时的文件位置。后续目录已按模块整理，当前路径见[第 16a 步](16a-project-layout.md)；构建与运行命令以[项目 README](../../README.zh-CN.md)为准。
+
 ## 这一步做成了什么
 
 SSTable 是 Sorted String Table：把按 key 排好序的数据写进文件，写好以后不再原地修改。本步提供独立的写文件和读文件接口，不改变 Store 的写入、恢复和 CLI。

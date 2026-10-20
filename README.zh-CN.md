@@ -213,22 +213,26 @@ ctest --test-dir build/network -R '^grpc_' --output-on-failure
 
 当前两种构建分别包含 19 和 21 组 CTest。覆盖记录损坏与截断、WAL 回放、manifest 发布、删除标记、后台任务交错、索引和缓存、Raft 选举与冲突修正、提交执行及进程崩溃。网络测试覆盖真实 KV 复制、Leader 被终止后重选、节点重启追赶、非法 RPC、并发管理调用及关闭。测试使用独立临时数据；网络测试需要允许绑定回环端口和启动子进程。
 
-普通网络构建和 AddressSanitizer/UndefinedBehaviorSanitizer 构建均已通过完整测试。验证记录和插桩范围见[网络实现说明](docs/steps/16-grpc-processes.md#验证入口)。测试耗时不等于吞吐量或延迟 benchmark。
+普通网络构建和 AddressSanitizer/UndefinedBehaviorSanitizer 构建均已通过完整测试。验证记录和插桩范围见[网络实现说明](docs/steps/16-grpc-processes.md#验证入口)。[目录整理](docs/steps/16a-project-layout.md)后已重新运行完整测试、既有线程检查，并验证全新目录构建。测试耗时不等于吞吐量或延迟 benchmark。
 
 ## 项目结构
 
 ```text
 include/kvstore/     存储引擎、Raft、复制协调层及 RPC 的公开接口
-src/                LSM 引擎、持久化工具、复制协调层和单机 CLI
+src/engine/         LSM 引擎、本地恢复、后台刷盘与合并
 src/raft/           Raft 状态机、复制及持久化日志
-src/rpc/            gRPC 运行层、编解码、节点及管理程序、可选构建规则
+src/replica/        Raft 与 Store 的协调层及提交记录
+src/rpc/            gRPC 运行层、编解码、配置和可选构建规则
+src/common/         内部文件操作和字节编码工具
+apps/               kvstore、kvnode、kvadmin 的程序入口
+examples/           进程内的 Raft 和复制存储演示
 proto/              Protobuf 消息和服务定义
-tests/             单元、集成、并发及进程崩溃测试
+tests/              按 engine/、raft/、replica/、rpc/ 分组的测试
 scripts/            项目内依赖构建脚本
 docs/               架构说明和逐步实现讲解，使用中文
 ```
 
-根目录的 `CMakeLists.txt` 负责引擎、Raft 和演示程序；启用 `KVSTORE_BUILD_GRPC` 后，在同一次构建中继续读取 `src/rpc/CMakeLists.txt`。Protobuf 生成文件位于 `build/network/src/rpc/generated/`，不要手动修改。编辑器解析头文件时，可使用网络构建生成的 `compile_commands.json`，其中包含生成目录和依赖头文件目录。
+根目录的 `CMakeLists.txt` 定义核心库、应用和演示；启用 `KVSTORE_BUILD_GRPC` 后读取 `src/rpc/CMakeLists.txt`，启用测试后读取 `tests/CMakeLists.txt`，都属于同一次构建。可执行程序仍输出到构建目录根部，原运行路径保持不变。Protobuf 生成文件位于 `build/network/src/rpc/generated/`，不要手动修改。编辑器解析头文件时，可使用网络构建生成的 `compile_commands.json`，其中包含生成目录和依赖头文件目录。
 
 ## 当前范围与后续工作
 
@@ -240,7 +244,9 @@ docs/               架构说明和逐步实现讲解，使用中文
 
 ## 延伸阅读
 
-- [单机存储架构](docs/architecture.md)：本地读写路径、文件生命周期、锁与恢复。
+- [总体架构](docs/architecture.md)：模块职责、复制写入、持久化与线程。
+- [单机存储架构](docs/storage-engine.md)：本地读写路径、文件生命周期、锁与恢复。
+- [目录整理记录](docs/steps/16a-project-layout.md)：旧新路径对照和回归验证结果。
 - [Raft 与 Store 集成](docs/steps/15-raft-store.md)：提交执行和重启恢复。
 - [gRPC 运行层与三进程使用](docs/steps/16-grpc-processes.md)：传输、线程、配置及故障处理。
 - [开发路线](ROADMAP.md)与[完成标准](GOAL.md)：实现顺序和剩余工作。

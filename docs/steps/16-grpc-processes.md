@@ -1,5 +1,7 @@
 # 第 16 步：gRPC 与三个独立进程
 
+> 路径说明：本文记录本步骤完成时的文件位置。后续目录已按模块整理，当前路径见[第 16a 步](16a-project-layout.md)；构建与运行命令以[项目 README](../../README.zh-CN.md)为准。
+
 这一步把之前由演示程序转交的消息，换成真正的本机 TCP/gRPC 传输。每个 kvnode 进程独占自己的 ReplicatedStore 和数据目录，监听不同端口。Raft、Store、COMMIT 的实现及磁盘格式保持原有职责。
 
 ## 先构建网络功能

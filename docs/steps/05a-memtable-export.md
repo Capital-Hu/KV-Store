@@ -1,5 +1,7 @@
 # 第 5a 步：MemTable 删除标记和有序导出
 
+> 路径说明：本文记录本步骤完成时的文件位置。后续目录已按模块整理，当前路径见[第 16a 步](16a-project-layout.md)；构建与运行命令以[项目 README](../../README.zh-CN.md)为准。
+
 ## 这轮的范围
 
 第 5 步需要把 MemTable、SSTable、文件集合和 WAL 生命周期接起来。为保持每轮可以理解，本轮先完成前置条件：MemTable 保留删除信息，并能导出一份可转换成 SSTable 的有序数据。

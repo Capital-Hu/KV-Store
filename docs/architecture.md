@@ -1,148 +1,104 @@
-# 单机存储引擎架构
+# 项目总体架构
 
-这份说明对应第 10 步时的实际实现。当前是一套单进程、支持并发调用的持久化 KV 引擎；三节点复制在下一阶段讨论。
+当前系统由 LSM 存储引擎、Raft 共识模块、复制协调层和 gRPC 运行层组成。三个 `kvnode` 进程各有一份独立数据；节点内部使用对象和函数调用连接，节点之间使用 gRPC。
 
-## 先看四种数据位置
+## 先区分库与程序
 
-```text
-                        新 → 旧
-查询顺序：可写 MemTable → 冻结 MemTable → 最新 SSTable → 更旧 SSTable
-
-可写 MemTable ──冻结──→ 冻结 MemTable ──后台写出──→ 新 SSTable
-     ↑                       ↑
-当前 WAL 负责恢复         冻结 WAL 负责恢复
-
-多个旧 SSTable ──后台合并──→ 一个新 SSTable
-```
-
-MemTable 是内存中的有序 map；SSTable 是磁盘上的不可变有序文件。一个 key 可以在多个位置都有版本，查询采用上述顺序，找到值或删除标记就停止。
-
-删除标记的意思是“这里有一条更新的删除操作”，与“这个位置没有这个 key”不同。前者阻止查询继续返回旧值。
-
-## 每种文件和对象负责什么
-
-假设调用方传入基础路径 `build/demo.wal`。即使这个原始 WAL 文件后来被回收，仍用相同基础路径打开 Store。
-
-| 文件或对象 | 内容与职责 | 是否是恢复来源 |
+| 目录 | 职责 | 主要文件 |
 | --- | --- | --- |
-| `demo.wal` / `demo.wal.N` | Put/Delete 的追加日志；轮换后用编号路径 | 是，按 manifest 指定的 WAL 回放 |
-| `demo.wal.sst.N` | 按 key 排序的不可变记录，包括尚需保留的删除标记 | 是，作为查询用的磁盘状态直接打开 |
-| `demo.wal.manifest` | SSTable 的新旧顺序、当前 WAL、可选冻结 WAL、下一文件编号 | 是，决定哪些文件有效 |
-| `demo.wal.manifest.tmp` | 尚未替换正式清单的候选内容 | 启动不以它作为正式清单 |
-| `demo.wal.lock` | 同一基础路径只允许一个 Store 打开 | 不保存用户数据 |
-| 可写/冻结 MemTable | 最新记录的内存视图 | 重启后从对应 WAL 重建 |
-| 每张表的 Bloom、块索引 | 排除无关表、定位候选块 | 否，打开 SSTable 时重建 |
-| 每个 Store 的共享块缓存 | 保存最近读取的不可变编码块 | 否，重启从空缓存开始 |
+| `src/engine/` | 单机 KV 存储与本地恢复 | `store.cpp`、`sstable.cpp`、`background_flush.cpp`、`background_compaction.cpp` |
+| `src/raft/` | 选举、复制、提交和协议持久化 | `node.cpp`、`replication.cpp`、`storage.cpp` |
+| `src/replica/` | 将已提交日志应用到 Store，保存恢复依据 | `replicated_store.cpp`、`replica_checkpoint.cpp` |
+| `src/rpc/` | 消息转换、网络服务、计时、发送线程和生命周期 | `node_server.cpp`、`protocol_codec.cpp`、`config.cpp` |
+| `src/common/` | 共享的内部文件操作和编码 | `file_io.h/.cpp`、`coding.h` |
+| `apps/` | 命令行参数解析及程序入口 | `kvstore_main.cpp`、`kvnode_main.cpp`、`kvadmin_main.cpp` |
+| `examples/` | 进程内模拟消息交付的演示 | `raft_demo.cpp`、`replica_demo.cpp` |
+| `tests/` | 按 engine、raft、replica、rpc 分组的验证 | 各模块的 `*_test.cpp` |
 
-编号由 WAL 和 SSTable 共用。**数据版本的新旧由 manifest 中的 SSTable 顺序决定，不能只比较文件编号。** 合并输出的编号可能较大，但内容仍应放在合并期间新增表的前面，保持旧到新的顺序。
+公开接口放在 `include/kvstore/`，因此调用方继续使用 `#include "kvstore/store.h"` 等路径。内部头文件放在对应模块旁边，保持实现细节不进入公开 API。
 
-## 写一条数据
-
-```text
-Put / Delete
-    ↓ 取得状态锁、检查可用状态、编码记录
-等待写入空间（条件不满足时释放锁等待，满足后重新持锁）
-    ↓
-向当前 WAL 追加完整记录
-    ↓
-同步 WAL
-    ↓
-更新可写 MemTable
-    ↓
-必要时冻结并安排后台刷盘
-    ↓
-成功返回
-```
-
-写入成功时，数据可能还不在 SSTable，但已经有同步后的 WAL 用于恢复。Delete 即使返回 false，也会记录删除标记；false 表示操作前没有可见值。
-
-当前每次成功写入都同步 WAL，没有批量提交或事务。一次调用若报错，不能仅凭错误推断磁盘完全没写入；涉及不确定状态的失败会使 Store 停止服务，需关闭后重新打开。
-
-## 冻结与刷盘为什么分两次发布
-
-1. 持有状态锁，等待唯一的冻结槽空闲。
-2. 创建并同步新 WAL，同时同步目录。
-3. 发布清单：同时列出旧的冻结 WAL 和新的可写 WAL。
-4. 把可写 MemTable 的所有权交给冻结表，切换当前 WAL，唤醒刷盘线程。
-5. 刷盘线程释放状态锁，写出并同步冻结表对应的 SSTable，建立 reader。
-6. 重新取得状态锁，在**当前**清单基础上追加该 SSTable，移除冻结 WAL 引用，再发布清单。
-7. 接入 reader、移除冻结表，最后删除旧 WAL 并同步目录。
-
-第一次发布保证切换后的两份内存都有恢复来源；第二次发布把冻结表的恢复职责从旧 WAL 交给 SSTable。
-
-默认按可写 MemTable 最新条目的编码大小达到 4 MiB 触发冻结。这不是精确堆内存上限，也不是 WAL 文件长度上限。只有一个冻结槽；槽被占用且可写表已满时，写线程等待并释放锁。Get 和后台任务仍可在取得锁后执行。
-
-`RequestFlush()` 等到能够冻结并排队后返回；`Flush()` 还要等对应 SSTable 发布完成。正常退出会收尾已排队的后台任务，不主动冻结剩余可写表，剩余数据由当前 WAL 恢复。
-
-## 查询一条数据
+程序与库的关系如下：
 
 ```text
-Get(key)，持有 Store 状态锁
-    ↓
-可写 MemTable：有记录则返回值或删除结果
-    ↓ 没记录
-冻结 MemTable：有记录则返回值或删除结果
-    ↓ 没记录
-从新到旧逐张查询 SSTable
-    ↓
-Bloom：肯定没有则换下一张表
-    ↓ 可能存在
-二分块索引：找到第一个块末尾 key >= key 的候选块
-    ↓
-共享缓存：命中则取得块字节；未命中则从文件读取、校验并尝试缓存
-    ↓
-块内解析、精确比较
-    ├─ 找到 Value：返回
-    ├─ 找到 Tombstone：返回不存在，不查旧表
-    └─ 没找到：换下一张表
+kvstore       → 存储引擎
+raft_demo     → Raft
+replica_demo  → ReplicatedStore → Raft + 存储引擎
+kvnode        → gRPC 运行层 → ReplicatedStore → Raft + 存储引擎
+kvadmin       → 管理 RPC 的客户端，连接明确指定的节点
 ```
 
-SSTable 仍采用 KVS1 格式。约 4 KiB 的块由连续完整记录组成，索引在打开时扫描重建；没有落盘索引或 footer。索引预算不足时整张表退回顺序查询。缓存默认共用 8 MiB 原始块字节预算，不包含索引、Bloom、容器元数据或调用方暂时持有的已淘汰块。
+`kvnode` 不会再启动一个 `kvstore` 子进程。每个节点内的网络服务、Raft 和 Store 都属于同一进程。
 
-缓存命中也要解析和匹配 key。缓存编号属于 reader，reader 关闭时清除其缓存项；合并后新 reader 不会误用旧文件的块。
+## 运行时如何连接
 
-## 后台合并
-
-```text
-持有状态锁：记录当前全部 SSTable，预留输出编号
-    ↓ 释放状态锁
-独立 reader 流式合并，重复 key 取较新输入；写出并同步新表
-    ↓ 重新取得状态锁
-检查输入仍是当前 SSTable 集合的最旧前缀
-    ↓
-在当前清单基础上，用输出替换这些输入，保留期间新增的表及 WAL 状态
-    ↓
-发布清单 → 切换 reader → 关闭旧 reader / 清缓存 → 回收旧文件
+```mermaid
+flowchart LR
+    Admin["kvadmin"] -->|管理 RPC| RPC
+    subgraph N1["节点 1：一个 kvnode 进程"]
+        RPC["gRPC 服务和发送队列"] --> Replica["ReplicatedStore"]
+        Replica --> Raft["Raft Node + Storage"]
+        Replica --> Engine["本地 Store"]
+    end
+    RPC <-->|Raft 消息| N2["节点 2：相同组件，独立目录"]
+    RPC <-->|Raft 消息| N3["节点 3：相同组件，独立目录"]
+    N2 <-->|Raft 消息| N3
 ```
 
-默认每次刷盘发布后，SSTable 数达到 4 会请求后台合并。手动 Compact 会排队并等待自己的请求完成，但不主动刷出可写 MemTable。
+任一节点都可能当选 Leader。Raft 核心不调用网络、不直接执行 Store；它接收消息和时间推进事件，将待发送消息放入信箱。运行层负责交付，复制协调层负责执行已提交命令。
 
-Store 合并开始时覆盖了全部旧磁盘表，且当前没有历史快照，因此可以丢掉这些输入里最新版本仍为删除标记的 key。独立的部分合并默认保留删除标记，防止输入之外的旧值复活。
+## 一次写入的路径
 
-## 锁保护什么
+1. 管理工具向 Leader 的 `Propose` RPC 提交 Put/Delete。
+2. `ReplicatedStore` 调用 Raft，将命令写入本地复制日志，产生待发送消息。
+3. 运行层提取消息并交给各 peer 的发送队列，通过 gRPC 发给其他节点。
+4. Follower 持久化后产生 Raft 回复；回复通过反方向的独立消息返回。
+5. Leader 按多数派与任期规则推进提交位置，协调层先同步保存 COMMIT 记录，再顺序调用本地 Store。
+6. Store 追加并同步自己的 WAL，更新 MemTable；Follower 在得知提交位置后执行相同命令。
 
-| 锁 | 保护内容 | 持锁的主要操作 |
+`Propose` 返回的 `(index, term)` 是提议标识，不是提交成功通知。`applied` 用这个标识检查指定节点是否已经执行对应条目。一次消息交付 RPC 返回成功，也不能作为 Raft 的多数派确认。
+
+## 三种持久化信息
+
+| 文件 | 保存什么 | 恢复时的职责 |
 | --- | --- | --- |
-| Store 的 `mutex_` | MemTable、当前 WAL 写入、有效 reader 集合、manifest 状态、任务计数与错误状态 | 前台 Get/Put/Delete，冻结，后台任务的准备和发布 |
-| 缓存自己的 mutex | 块映射、LRU 顺序、字节计费及统计 | 缓存查找、接纳、淘汰和 reader 清理 |
-| `.lock` 文件锁 | 同一基础路径的独占打开权 | 从 Store 打开一直持有到关闭 |
+| `raft` 及其配套文件 | 节点身份、任期、投票和复制日志 | 恢复协议状态与命令顺序 |
+| `COMMIT` | 已保存的提交位置、任期和前缀校验信息 | 限定启动时可以重新执行的日志前缀 |
+| `data`、`data.N`、`data.sst.N`、`data.manifest` 等 Store 文件 | 本地写入日志、有序数据和有效文件集合 | 恢复本地内存状态并提供查询 |
 
-前台 Get/Put/Delete 目前共用一把较大粒度的状态锁；WAL 同步也在其中。后台写 SSTable、流式合并不持有这把锁，发布新状态时才重新取得它。冻结表和已有 SSTable 在后台处理期间不可变。
+`data` 是传给 Store 的基础路径，也是初始 WAL。目录中的 `LOCK` 及模块配套锁文件用于独占打开。
 
-条件变量用于等待状态变化。`wait` 睡眠时释放 Store 状态锁，醒来后重新取得并检查条件；`notify` 只负责唤醒，不替等待者修改数据。关闭时先要求后台退出，再在不持有状态锁的情况下等待线程完成。
+启动时先验证节点身份、Raft 状态和 COMMIT 的前缀依据，打开本地 Store，完成已保存提交前缀的重放后才向调用方暴露读取。当前会重放整个保存的前缀，依赖 Put/Delete 的最终状态幂等性；没有 Raft 快照、日志截断或 exactly-once 承诺。
 
-## 发布与启动恢复
+## 查询、刷盘和合并
 
-每次发布清单都依次执行：写 `.manifest.tmp` → 同步临时文件 → rename 替换正式清单 → 同步目录。旧数据的回收发生在新清单发布后。
+`LocalGet` 读取指定节点已经执行的本地状态，路径为：
 
-启动时取得独占锁，读取正式清单，打开并完整校验指定 SSTable，回放指定 WAL。冻结 WAL 严格校验；当前 WAL 默认也严格校验，只有显式尾部恢复模式允许丢弃不完整后缀。全部有效来源验证成功后才清理孤立/过期文件，然后启动后台线程，继续刷出恢复的冻结表。
+```text
+可写 MemTable → 冻结 MemTable → 从新到旧的 SSTable
+                               ↓ 每张表
+                    Bloom → 块索引 → 缓存或文件 → 精确比较
+```
 
-SSTable 不需要像 WAL 一样回放到 MemTable，它本身已经是可以查询的有序状态。WAL 回放只重建尚未由有效 SSTable 承担的可写/冻结状态。
+遇到值或删除标记就结束查找。Follower 和被隔离的旧 Leader 都可能提供旧数据；当前没有一致性客户端读接口。
 
-## 当前范围与后续边界
+Store 的后台刷盘将冻结 MemTable 转为 SSTable，再发布 manifest 并回收对应旧 WAL。后台合并整理多个 SSTable，发布替换后的文件集合，再回收旧表。这些操作不会压缩 Raft 日志。完整细节见[单机存储架构](storage-engine.md)。
 
-已具备 WAL、SSTable、后台刷盘与合并、Bloom、块索引和共享块缓存，并通过单机集成及进程强杀恢复验证。完整证据见 [第 10 步](steps/10-engine-integration.md)。
+## 线程与锁
 
-没有事务、MVCC、历史快照、持久化 Bloom/块索引、块压缩或分层合并策略；前台访问仍串行取得状态锁。尚未做实际断电实验或吞吐量/尾延迟 benchmark。
+| 执行者或锁 | 保护或执行的内容 |
+| --- | --- |
+| gRPC 回调、计时线程 | 持有同一把节点状态锁后访问 ReplicatedStore，并提取待发送消息 |
+| 每个 peer 的独立发送线程 | 从自己的队列取消息，释放队列锁后发送 RPC；不占节点状态锁 |
+| Store 状态锁 | 可写/冻结内存表、WAL、manifest、当前 reader 和后台任务状态 |
+| Store 后台线程 | 在锁外写 SSTable 或合并，准备和发布时取得 Store 状态锁 |
+| 缓存锁 | LRU 顺序、缓存映射、容量和统计 |
 
-下一阶段需要先讨论 Raft 的复制日志、提交和应用，再接入引擎。当前 WAL 负责单机恢复，不提供多数派提交或三节点一致性。
+协议和协调层继续按串行事件模型使用。持久化同步发生在事件处理过程中，会阻塞同节点其他事件。条件变量等待期间释放对应互斥锁，醒来后重新获取并检查条件。
+
+## 构建入口与使用
+
+[根 CMakeLists](../CMakeLists.txt) 定义核心库、应用和演示。启用 `KVSTORE_BUILD_GRPC` 时读取 [RPC 构建规则](../src/rpc/CMakeLists.txt)，生成 Protobuf 类型并构建网络库；启用测试时读取[测试构建规则](../tests/CMakeLists.txt)。这些都是同一次配置和构建。
+
+可执行文件输出到所选构建目录根部，Protobuf 生成文件仍放在该构建目录的 `src/rpc/generated/`。常用构建、三节点启动和测试命令见[中文 README](../README.zh-CN.md)或[英文 README](../README.md)。
+
+当前完成第 16 阶段；客户端语义、系统性网络故障验证和性能测试仍待后续步骤。目录迁移和验证记录见[第 16a 步](steps/16a-project-layout.md)。

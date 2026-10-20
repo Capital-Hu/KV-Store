@@ -1,5 +1,5 @@
 #include "kvstore/rpc/node_server.h"
-#include "../src/rpc/protocol_codec.h"
+#include "rpc/protocol_codec.h"
 #include "raft_node.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>

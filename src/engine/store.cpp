@@ -1,6 +1,6 @@
 #include "kvstore/store.h"
 #include "kvstore/wal_record.h"
-#include "file_io.h"
+#include "common/file_io.h"
 
 #include <cerrno>
 #include <charconv>

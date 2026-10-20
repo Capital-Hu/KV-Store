@@ -1,5 +1,7 @@
 # 第 6 步：同步 compaction
 
+> 路径说明：本文记录本步骤完成时的文件位置。后续目录已按模块整理，当前路径见[第 16a 步](16a-project-layout.md)；构建与运行命令以[项目 README](../../README.zh-CN.md)为准。
+
 ## 本步做了什么
 
 新增 `Store::Compact()` 和 CLI `compact`，把当前全部 SSTable 合并成一个新 SSTable，保留每个 key 的最新磁盘状态，然后同步发布清单、回收旧文件。本步手动触发，在调用线程中完成；不引入后台线程或分层调度。

@@ -1,7 +1,7 @@
 #include "kvstore/raft/node.h"
 #include "kvstore/raft/storage.h"
-#include "../src/raft/storage_codec.h"
-#include "../src/coding.h"
+#include "raft/storage_codec.h"
+#include "common/coding.h"
 
 #include <cerrno>
 #include <csignal>

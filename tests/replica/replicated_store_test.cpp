@@ -1,5 +1,5 @@
 #include "kvstore/replicated_store.h"
-#include "../src/replica_checkpoint.h"
+#include "replica/replica_checkpoint.h"
 
 #include <algorithm>
 #include <cerrno>

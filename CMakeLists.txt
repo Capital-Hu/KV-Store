@@ -4,129 +4,54 @@ option(KVSTORE_BUILD_GRPC "Build the gRPC node, admin tool and network tests" OF
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 find_package(Threads REQUIRED)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+include(CTest)
 
-add_library(kvstore_file_io STATIC src/file_io.cpp)
+add_library(kvstore_file_io STATIC src/common/file_io.cpp)
 target_compile_features(kvstore_file_io PUBLIC cxx_std_17)
 
-add_library(kvstore_engine STATIC src/memtable.cpp src/wal_record.cpp src/store.cpp src/sstable.cpp
-    src/manifest.cpp src/compaction.cpp src/background_compaction.cpp src/background_flush.cpp
-    src/bloom_filter.cpp src/block_cache.cpp)
+add_library(kvstore_engine STATIC src/engine/memtable.cpp src/engine/wal_record.cpp
+    src/engine/store.cpp src/engine/sstable.cpp src/engine/manifest.cpp src/engine/compaction.cpp
+    src/engine/background_compaction.cpp src/engine/background_flush.cpp
+    src/engine/bloom_filter.cpp src/engine/block_cache.cpp)
 target_include_directories(kvstore_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(kvstore_engine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_features(kvstore_engine PUBLIC cxx_std_17)
 target_link_libraries(kvstore_engine PUBLIC Threads::Threads)
 target_link_libraries(kvstore_engine PRIVATE kvstore_file_io)
 
 add_library(kvstore_raft STATIC src/raft/node.cpp src/raft/replication.cpp src/raft/storage.cpp src/raft/storage_codec.cpp)
 target_include_directories(kvstore_raft PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(kvstore_raft PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_features(kvstore_raft PUBLIC cxx_std_17)
 target_link_libraries(kvstore_raft PRIVATE kvstore_file_io)
 
-add_library(kvstore_replica STATIC src/replicated_store.cpp src/replica_checkpoint.cpp)
+add_library(kvstore_replica STATIC src/replica/replicated_store.cpp src/replica/replica_checkpoint.cpp)
 target_include_directories(kvstore_replica PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(kvstore_replica PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_features(kvstore_replica PUBLIC cxx_std_17)
 target_link_libraries(kvstore_replica PUBLIC kvstore_raft kvstore_engine PRIVATE kvstore_file_io)
 
-add_executable(kvstore src/main.cpp)
-target_link_libraries(kvstore PRIVATE kvstore_engine)
-
-add_executable(raft_demo src/raft_demo.cpp)
-target_link_libraries(raft_demo PRIVATE kvstore_raft)
-
-add_executable(replica_demo src/replica_demo.cpp)
-target_link_libraries(replica_demo PRIVATE kvstore_replica)
-
-include(CTest)
-if(BUILD_TESTING)
-    add_executable(memtable_test tests/memtable_test.cpp)
-    target_link_libraries(memtable_test PRIVATE kvstore_engine)
-    add_test(NAME memtable COMMAND memtable_test)
-
-    add_executable(wal_record_test tests/wal_record_test.cpp)
-    target_link_libraries(wal_record_test PRIVATE kvstore_engine)
-    add_test(NAME wal_record COMMAND wal_record_test)
-
-    add_executable(store_test tests/store_test.cpp)
-    target_link_libraries(store_test PRIVATE kvstore_engine)
-    add_test(NAME store COMMAND store_test)
-    set_tests_properties(store PROPERTIES TIMEOUT 30)
-
-    add_executable(sstable_test tests/sstable_test.cpp)
-    target_link_libraries(sstable_test PRIVATE kvstore_engine)
-    add_test(NAME sstable COMMAND sstable_test)
-
-    add_executable(manifest_test tests/manifest_test.cpp)
-    target_link_libraries(manifest_test PRIVATE kvstore_engine)
-    add_test(NAME manifest COMMAND manifest_test)
-
-    add_executable(store_flush_test tests/store_flush_test.cpp)
-    target_link_libraries(store_flush_test PRIVATE kvstore_engine)
-    add_test(NAME store_flush COMMAND store_flush_test)
-    set_tests_properties(store_flush PROPERTIES TIMEOUT 60)
-
-    add_executable(compaction_test tests/compaction_test.cpp)
-    target_link_libraries(compaction_test PRIVATE kvstore_engine)
-    add_test(NAME compaction COMMAND compaction_test)
-    set_tests_properties(compaction PROPERTIES TIMEOUT 60)
-
-    add_executable(background_test tests/background_test.cpp)
-    target_link_libraries(background_test PRIVATE kvstore_engine)
-    add_test(NAME background COMMAND background_test)
-    set_tests_properties(background PROPERTIES TIMEOUT 60)
-
-    add_executable(background_flush_test tests/background_flush_test.cpp)
-    target_link_libraries(background_flush_test PRIVATE kvstore_engine)
-    add_test(NAME background_flush COMMAND background_flush_test)
-    set_tests_properties(background_flush PROPERTIES TIMEOUT 60)
-
-    add_executable(bloom_filter_test tests/bloom_filter_test.cpp)
-    target_link_libraries(bloom_filter_test PRIVATE kvstore_engine)
-    add_test(NAME bloom_filter COMMAND bloom_filter_test)
-
-    add_executable(sstable_bloom_test tests/sstable_bloom_test.cpp)
-    target_link_libraries(sstable_bloom_test PRIVATE kvstore_engine)
-    add_test(NAME sstable_bloom COMMAND sstable_bloom_test)
-    set_tests_properties(sstable_bloom PROPERTIES TIMEOUT 60)
-
-    add_executable(block_cache_test tests/block_cache_test.cpp)
-    target_link_libraries(block_cache_test PRIVATE kvstore_engine)
-    add_test(NAME block_cache COMMAND block_cache_test)
-    set_tests_properties(block_cache PROPERTIES TIMEOUT 60)
-
-    add_executable(sstable_index_test tests/sstable_index_test.cpp)
-    target_link_libraries(sstable_index_test PRIVATE kvstore_engine)
-    add_test(NAME sstable_index COMMAND sstable_index_test)
-    set_tests_properties(sstable_index PROPERTIES TIMEOUT 60)
-
-    add_executable(engine_integration_test tests/engine_integration_test.cpp)
-    target_link_libraries(engine_integration_test PRIVATE kvstore_engine)
-    add_test(NAME engine_integration COMMAND engine_integration_test)
-    set_tests_properties(engine_integration PROPERTIES TIMEOUT 120)
-
-    add_executable(raft_model_test tests/raft_model_test.cpp)
-    target_link_libraries(raft_model_test PRIVATE kvstore_raft)
-    add_test(NAME raft_model COMMAND raft_model_test)
-
-    add_executable(raft_storage_test tests/raft_storage_test.cpp)
-    target_link_libraries(raft_storage_test PRIVATE kvstore_raft)
-    add_test(NAME raft_storage COMMAND raft_storage_test)
-    set_tests_properties(raft_storage PROPERTIES TIMEOUT 120)
-
-    add_executable(raft_election_test tests/raft_election_test.cpp)
-    target_link_libraries(raft_election_test PRIVATE kvstore_raft)
-    add_test(NAME raft_election COMMAND raft_election_test)
-    set_tests_properties(raft_election PROPERTIES TIMEOUT 120)
-
-    add_executable(raft_replication_test tests/raft_replication_test.cpp)
-    target_link_libraries(raft_replication_test PRIVATE kvstore_raft)
-    add_test(NAME raft_replication COMMAND raft_replication_test)
-    set_tests_properties(raft_replication PROPERTIES TIMEOUT 120)
-
-    add_executable(replicated_store_test tests/replicated_store_test.cpp)
-    target_link_libraries(replicated_store_test PRIVATE kvstore_replica)
-    add_test(NAME replicated_store COMMAND replicated_store_test)
-    set_tests_properties(replicated_store PROPERTIES TIMEOUT 120)
-endif()
-
 if(KVSTORE_BUILD_GRPC)
     add_subdirectory(src/rpc)
+endif()
+
+add_executable(kvstore apps/kvstore_main.cpp)
+target_link_libraries(kvstore PRIVATE kvstore_engine)
+
+add_executable(raft_demo examples/raft_demo.cpp)
+target_link_libraries(raft_demo PRIVATE kvstore_raft)
+
+add_executable(replica_demo examples/replica_demo.cpp)
+target_link_libraries(replica_demo PRIVATE kvstore_replica)
+
+if(KVSTORE_BUILD_GRPC)
+    add_executable(kvnode apps/kvnode_main.cpp)
+    target_link_libraries(kvnode PRIVATE kvstore_rpc)
+    add_executable(kvadmin apps/kvadmin_main.cpp)
+    target_link_libraries(kvadmin PRIVATE kvstore_rpc)
+endif()
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
 endif()

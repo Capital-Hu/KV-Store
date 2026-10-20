@@ -1,7 +1,7 @@
 #include "kvstore/sstable.h"
 #include "kvstore/wal_record.h"
-#include "coding.h"
-#include "file_io.h"
+#include "common/coding.h"
+#include "common/file_io.h"
 
 #include <algorithm>
 #include <cerrno>

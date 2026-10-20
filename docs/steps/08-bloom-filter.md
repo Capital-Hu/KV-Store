@@ -1,5 +1,7 @@
 # 第 8 步：SSTable 的 Bloom filter
 
+> 路径说明：本文记录本步骤完成时的文件位置。后续目录已按模块整理，当前路径见[第 16a 步](16a-project-layout.md)；构建与运行命令以[项目 README](../../README.zh-CN.md)为准。
+
 本记录反映第 8 步交付时的顺序查询；当前新增块索引和缓存，见 [第 9 步](09-block-index-cache.md)。本记录中的扫描量样本仍通过显式关闭索引单独验证 Bloom。
 
 本轮让 Get 在扫描一个 SSTable 前，先判断“这个文件一定没有该 key”。已有的刷盘、WAL、清单发布与合并协议继续使用。

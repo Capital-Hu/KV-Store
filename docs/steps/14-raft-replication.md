@@ -1,5 +1,7 @@
 # 第 14 步：Raft 日志复制、冲突修正与提交
 
+> 路径说明：本文记录本步骤完成时的文件位置。后续目录已按模块整理，当前路径见[第 16a 步](16a-project-layout.md)；构建与运行命令以[项目 README](../../README.zh-CN.md)为准。
+
 本轮让三个 Raft 节点复制 Put/Delete 日志，并确认哪些日志已提交。仍然是单线程事件模型、三个对象和三份独立磁盘文件。下一步才把已提交命令交给 Store 执行；本轮 `last_applied` 保持 0。
 
 本文件保留第 14 步交付范围；第 15 步已新增 ReplicatedStore 和 replica_demo 来执行到实际 Store，见 [第 15 步说明](15-raft-store.md)。原 raft_demo 仍保留纯协议演示。

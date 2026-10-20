@@ -1,5 +1,7 @@
 # 第 10 步：单机集成与进程故障验证
 
+> 路径说明：本文记录本步骤完成时的文件位置。后续目录已按模块整理，当前路径见[第 16a 步](16a-project-layout.md)；构建与运行命令以[项目 README](../../README.zh-CN.md)为准。
+
 这一轮把已经实现的模块放在同一组场景里验收，新增集成测试和架构说明。保留第 9 步的内存块索引方案，不修改文件格式、引擎接口或 CLI，也不引入 Raft。
 
 ## 改了哪些文件
@@ -8,7 +10,7 @@
 | --- | --- |
 | `tests/engine_integration_test.cpp` | 独立内存模型对照、四层读取、成功通知和进程强杀恢复 |
 | `CMakeLists.txt` | 注册 `engine_integration_test` 目标和 `engine_integration` CTest，超时 120 秒 |
-| `docs/architecture.md` | 汇总各文件职责、读写、冻结、合并、锁与恢复流程 |
+| `docs/storage-engine.md` | 汇总各文件职责、读写、冻结、合并、锁与恢复流程 |
 | README、ROADMAP、GOAL | 更新测试入口、证据和进度 |
 
 已有生产代码不需要为本轮新增故障开关。测试继续通过已有的私有 `StoreTestAccess` 边界回调控制时机；这些安装接口只存在于测试可执行文件中。

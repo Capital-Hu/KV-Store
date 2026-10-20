@@ -1,5 +1,5 @@
 #include "kvstore/manifest.h"
-#include "../src/coding.h"
+#include "common/coding.h"
 
 #include <functional>
 #include <iostream>

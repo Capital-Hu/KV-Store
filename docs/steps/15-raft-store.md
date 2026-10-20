@@ -1,5 +1,7 @@
 # 第 15 步：把已提交日志执行到 Store
 
+> 路径说明：本文记录本步骤完成时的文件位置。后续目录已按模块整理，当前路径见[第 16a 步](16a-project-layout.md)；构建与运行命令以[项目 README](../../README.zh-CN.md)为准。
+
 这一步接通之前独立开发的两部分：Raft 确认命令顺序和提交位置，Store 执行命令并提供实际 KV 数据。新增的 ReplicatedStore 负责协调两者；Raft 库本身仍不依赖 Store。
 
 本文件保留第 15 步交付范围。第 16 步已用网络运行层串行调用 ReplicatedStore，支持本机三个独立进程，见 [第 16 步说明](16-grpc-processes.md)；replica_demo 继续保留进程内演示。

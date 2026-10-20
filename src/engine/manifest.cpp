@@ -1,5 +1,5 @@
 #include "kvstore/manifest.h"
-#include "coding.h"
+#include "common/coding.h"
 
 #include <set>
 #include <stdexcept>
