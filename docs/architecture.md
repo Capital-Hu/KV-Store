@@ -2,6 +2,8 @@
 
 当前系统由 LSM 存储引擎、Raft 共识模块、复制协调层和 gRPC 运行层组成。三个 `kvnode` 进程各有一份独立数据；节点内部使用对象和函数调用连接，节点之间使用 gRPC。
 
+原规划第 0—19 步均已完成，读写、恢复、锁和验收证据的串联说明见[项目最终回顾](final-review.md)。
+
 ## 先区分库与程序
 
 | 目录 | 职责 | 主要文件 |
@@ -13,7 +15,8 @@
 | `src/common/` | 共享的内部文件操作和编码 | `file_io.h/.cpp`、`coding.h` |
 | `apps/` | 命令行参数解析及程序入口 | `kvstore_main.cpp`、`kvnode_main.cpp`、`kvadmin_main.cpp`、`kvclient_main.cpp` |
 | `examples/` | 进程内模拟消息交付的演示 | `raft_demo.cpp`、`replica_demo.cpp` |
-| `tests/` | 按 engine、raft、replica、rpc 分组的验证 | 各模块的 `*_test.cpp` |
+| `benchmarks/` | 复用 Client 进行混合负载与延迟统计 | `kvbench.cpp`、`workload.h` |
+| `tests/` | 按 engine、raft、replica、rpc、benchmark 分组的验证 | 各模块的测试与流程检查 |
 
 公开接口放在 `include/kvstore/`，因此调用方继续使用 `#include "kvstore/store.h"` 等路径。内部头文件放在对应模块旁边，保持实现细节不进入公开 API。
 

@@ -4,9 +4,11 @@
 
 一个使用 C++17 实现的持久化键值存储，将 LSM 存储引擎与基于 gRPC 的三节点 Raft 复制结合起来。每个节点作为独立进程运行，保存自己的数据副本。
 
-项目直接实现存储与共识的核心逻辑，包括 WAL 恢复、不可变 SSTable、后台刷盘与合并、选主、日志复制及已提交命令的执行。目前本机三节点集群已可运行，包含客户端库和命令行工具，提供提交确认、一致性读屏障、Leader 发现及明确的写入未知结果语义。本机故障矩阵已覆盖分区、消息丢失／延迟／重复／乱序及崩溃恢复；可复现混合负载 benchmark 记录完整调用的吞吐量与 P50/P95/P99 延迟。这是一个系统学习项目，当前范围和测量限制见下文。
+项目直接实现存储与共识的核心逻辑，包括 WAL 恢复、不可变 SSTable、后台刷盘与合并、选主、日志复制及已提交命令的执行。目前本机三节点集群已可运行，包含客户端库和命令行工具，提供提交确认、一致性读屏障、Leader 发现及明确的写入未知结果语义。本机故障矩阵已覆盖分区、消息丢失／延迟／重复／乱序及崩溃恢复；可复现混合负载 benchmark 记录完整调用的吞吐量与 P50/P95/P99 延迟。
 
-[功能](#功能) · [架构](#架构) · [构建与运行](#构建与本地运行) · [测试](#测试) · [性能测量](#性能测量) · [当前范围](#当前范围与后续工作)
+**工程状态：** 原规划的存储引擎与三节点复制功能及验证均已完成，包含故障恢复和 benchmark 实测。[架构回顾](docs/final-review.md)汇总了实现与验收证据。这是一个系统学习项目，当前[范围与限制](#当前范围与限制)见下文。
+
+[功能](#功能) · [架构](#架构) · [构建与运行](#构建与本地运行) · [测试](#测试) · [性能测量](#性能测量) · [当前范围](#当前范围与限制)
 
 ## 功能
 
@@ -26,18 +28,20 @@
 
 ```mermaid
 flowchart LR
+    Client["Client / kvclient / kvbench"] -->|键值 RPC| RPC1
     Admin["kvadmin"] -->|管理 RPC| RPC1
     subgraph Node1["节点 1：一个 kvnode 进程"]
         RPC1["gRPC 服务"] --> Replica["ReplicatedStore"]
         Replica --> Raft["Raft 节点 + 持久化日志"]
         Replica --> Store["LSM Store + WAL + SSTable"]
+        Replica --> Commit["COMMIT 提交依据"]
     end
     RPC1 <-->|Raft 消息| Node2["节点 2：相同组件，独立数据"]
     RPC1 <-->|Raft 消息| Node3["节点 3：相同组件，独立数据"]
     Node2 <-->|Raft 消息| Node3
 ```
 
-图中展示的是组件关系，任一节点都可能当选 Leader。`kvadmin` 连接的是使用者明确指定的地址。
+图中展示的是组件关系，任一节点都可能当选 Leader。正式业务操作由 Client 自动发现 Leader；`kvadmin` 连接使用者明确指定的地址进行诊断。
 
 ### 复制写入流程
 
@@ -46,7 +50,7 @@ flowchart LR
 3. 满足 Raft 的多数派与任期规则后，`ReplicatedStore` 保存已提交前缀的依据，并按顺序执行命令。
 4. 本地 `Store` 同步 WAL 并更新 MemTable 后，客户端才收到 `OK`。Follower 得知条目已提交后也会执行。管理工具 `kvadmin propose-put` 仍只返回接收提议的回执。
 
-**Raft 日志**记录需要复制的命令历史，**Store WAL**用于恢复本地 MemTable。两者是职责不同的持久化层。
+**Raft 日志**记录需要复制的命令历史，**Store WAL**用于恢复本地 MemTable。两者是职责不同的持久化层。**COMMIT 提交依据**持久记录已提交前缀，供协调层启动时确定重放范围。
 
 ### 本地查询与后台任务
 
@@ -175,7 +179,6 @@ cluster_members='1=127.0.0.1:50051,2=127.0.0.1:50052,3=127.0.0.1:50053'
 
 需要诊断时，使用 `kvadmin` 查看选举结果：
 
-
 ```sh
 ./build/network/kvadmin 127.0.0.1:50051 status
 ./build/network/kvadmin 127.0.0.1:50052 status
@@ -228,7 +231,13 @@ ctest --test-dir build/network --output-on-failure
 ctest --test-dir build/network -R '^(grpc_.*|client_process|cluster_fault)$' --output-on-failure
 ```
 
-当前两种构建分别包含 19 和 23 组 CTest。覆盖记录损坏与截断、WAL 回放、manifest 发布、删除标记、后台任务交错、索引和缓存、Raft 选举与冲突修正、提交执行及进程崩溃。网络测试覆盖真实 KV 复制、Leader 被终止后重选、节点重启追赶、非法 RPC、并发管理调用及关闭。客户端测试还覆盖提交确认、失去多数派、读屏障、安全重定向、实际提交后的回复丢失及 CLI 未知结果。七类集群故障场景进一步覆盖存活 Leader 隔离、Follower 隔离、单向丢失、完全分区、两种混合消息序列、崩溃／重启组合及路由校验。测试使用独立临时数据；网络测试需要允许绑定回环端口和启动子进程。
+| 构建配置 | CTest 组数 |
+| --- | --- |
+| 默认构建，关闭 gRPC | 19 |
+| 启用 gRPC | 23 |
+| 同时启用 gRPC 与 benchmark | 25 |
+
+覆盖记录损坏与截断、WAL 回放、manifest 发布、删除标记、后台任务交错、索引和缓存、Raft 选举与冲突修正、提交执行及进程崩溃。网络测试覆盖真实 KV 复制、Leader 被终止后重选、节点重启追赶、非法 RPC、并发管理调用及关闭。客户端测试还覆盖提交确认、失去多数派、读屏障、安全重定向、实际提交后的回复丢失及 CLI 未知结果。七类集群故障场景进一步覆盖存活 Leader 隔离、Follower 隔离、单向丢失、完全分区、两种混合消息序列、崩溃／重启组合及路由校验。测试使用独立临时数据；网络测试需要允许绑定回环端口和启动子进程。
 
 启用 benchmark 的 Release 和 AddressSanitizer/UndefinedBehaviorSanitizer 构建均已通过全部 25 组测试，包含原有 23 组。最新验证记录和插桩范围见[benchmark 说明](docs/steps/19-benchmark.md#自动化回归)，消息故障矩阵见[集群故障说明](docs/steps/18-cluster-faults.md#验证结果与范围)。此前[目录整理](docs/steps/16a-project-layout.md)记录了当时完成的线程检查和全新目录构建验证。测试耗时不等于吞吐量或延迟 benchmark。
 
@@ -254,6 +263,23 @@ python3 scripts/benchmark.py --build-dir build/release
 
 命令最后打印 `build/benchmark-results/` 下的报告位置。报告保留每轮结果、逐条延迟、结果计数、各操作统计、构建与机器信息，以及节点日志和数据；不会覆盖已有输出目录。启用 benchmark 的测试构建新增 `benchmark_workload` 和 `benchmark_smoke`，共 25 组 CTest，其他构建配置的测试数量不变。
 
+运行该构建的完整测试：
+
+```sh
+ctest --test-dir build/release --output-on-failure
+```
+
+### 本机实测结果
+
+实测环境为 Apple M3、16 GiB 内存、macOS arm64、Release 构建。下表每个范围来自三次独立运行，每轮正式请求 1000 次，预装 256 个 key，value 为 256 字节。延迟按全部正式调用计算 nearest-rank 分位数；12,000 次正式请求全部返回 Ok。
+
+| 负载 | 并发客户端 | 成功 ops/s | P50 ms | P95 ms | P99 ms |
+| --- | --- | --- | --- | --- | --- |
+| 95% Get / 5% Put | 1 | 55.87–61.49 | 15.978–17.332 | 20.350–24.306 | 24.808–29.102 |
+| 95% Get / 5% Put | 4 | 90.88–93.72 | 41.788–42.300 | 56.620–63.430 | 65.943–84.005 |
+| 50% Get / 40% Put / 10% Delete | 1 | 46.25–51.20 | 19.104–21.320 | 26.069–29.098 | 29.593–33.179 |
+| 50% Get / 40% Put / 10% Delete | 4 | 65.87–68.53 | 57.444–59.089 | 76.615–84.962 | 88.617–96.078 |
+
 吞吐量按正式总时间内的成功调用数计算；延迟包含完整 Client 调用、Leader 发现和读取的新 NoOp 屏障。这是单台机器、小工作集的闭环测试，没有固定到达速率，也不代表大 SSTable 或缓存性能。参数、逐轮结果和解释范围见[测量方法](docs/steps/19-benchmark.md)与[本机实测记录](docs/benchmarks/step19-local.md)。正式测量应在其他构建和测试结束后单独运行。
 
 ## 项目结构
@@ -276,16 +302,17 @@ docs/               架构说明和逐步实现讲解，使用中文
 
 根目录的 `CMakeLists.txt` 定义核心库、应用和演示；启用 `KVSTORE_BUILD_GRPC` 后读取 `src/rpc/CMakeLists.txt`，启用测试后读取 `tests/CMakeLists.txt`，都属于同一次构建。可执行程序仍输出到构建目录根部，原运行路径保持不变。Protobuf 生成文件位于 `build/network/src/rpc/generated/`，不要手动修改。编辑器解析头文件时，可使用网络构建生成的 `compile_commands.json`，其中包含生成目录和依赖头文件目录。
 
-## 当前范围与后续工作
+## 当前范围与限制
 
 - 网络运行层目前支持三个静态成员，仅接受 `127.0.0.1` 地址，使用无认证的明文 gRPC。
 - 客户端已提供一致性读取和提交确认。每次读取追加 NoOp；暂不提供请求去重、不确定写入的自动重放或 exactly-once 保证。
-- 暂无事务、MVCC、快照、Raft 日志截断及分层合并。Store 的 compaction 回收 SSTable，不负责压缩 Raft 日志。
+- 暂无事务、MVCC、快照、Raft 日志截断及分层合并。Store 的 compaction 回收 SSTable，不负责压缩 Raft 日志。逻辑 Raft 日志上限为 64 MiB、1,000,000 条，包含读取产生的屏障。
 - SSTable 的 Bloom 过滤器和块索引在打开文件时重建到内存。Store 的前台操作目前共用一把较大粒度的锁，每条写入单独同步 WAL。
 - 本机有限故障矩阵覆盖分区、单向丢失、消息延迟／重复／乱序、崩溃恢复和数据收敛；它不是穷尽所有历史的检查器，也不模拟 TCP 的每一种故障。benchmark 记录本机有限混合负载；大数据集、冷缓存、长期合并和固定到达速率下的容量尚未测量。
 
 ## 延伸阅读
 
+- [最终架构回顾与验收](docs/final-review.md)：串联读写、恢复、锁、提交规则和已完成范围。
 - [Benchmark 测量方法](docs/steps/19-benchmark.md)与[本机结果](docs/benchmarks/step19-local.md)：负载、计时、逐条样本与解释范围。
 - [集群故障矩阵](docs/steps/18-cluster-faults.md)：转发机制、场景、正确性检查和验证范围。
 - [客户端语义与使用](docs/steps/17-client-semantics.md)：Leader 发现、写入结果、一致性读取与重试。
@@ -294,5 +321,5 @@ docs/               架构说明和逐步实现讲解，使用中文
 - [目录整理记录](docs/steps/16a-project-layout.md)：旧新路径对照和回归验证结果。
 - [Raft 与 Store 集成](docs/steps/15-raft-store.md)：提交执行和重启恢复。
 - [gRPC 运行层与三进程使用](docs/steps/16-grpc-processes.md)：传输、线程、配置及故障处理。
-- [开发路线](ROADMAP.md)与[完成标准](GOAL.md)：实现顺序和剩余工作。
+- [开发路线](ROADMAP.md)与[完成标准](GOAL.md)：开发过程与验收记录。
 - [逐步实现讲解](docs/steps/)：按步骤记录设计和 C++ 知识点，使用中文。
