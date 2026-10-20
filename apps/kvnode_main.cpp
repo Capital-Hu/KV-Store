@@ -11,7 +11,7 @@ namespace {
 static_assert(std::atomic<bool>::is_always_lock_free, "Signal flag must not acquire a hidden lock");
 std::atomic<bool> stop_requested{false};
 extern "C" void StopSignal(int) { stop_requested.store(true, std::memory_order_relaxed); }
-constexpr auto kUsage = "kvnode --id ID --directory PATH --mode new|existing --members ID=127.0.0.1:PORT,ID=127.0.0.1:PORT,ID=127.0.0.1:PORT";
+constexpr auto kUsage = "kvnode --id ID --directory PATH --mode new|existing --members MEMBERS [--raft-routes MEMBERS]";
 }
 
 int main(int argc, char** argv) {
@@ -25,13 +25,16 @@ int main(int argc, char** argv) {
             if (argument == "--id") { options.id = kvstore::rpc::ParseUnsigned(value); }
             else if (argument == "--directory") { options.directory = value; }
             else if (argument == "--members") { options.members = kvstore::rpc::ParseMembers(value); }
+            else if (argument == "--raft-routes") { options.raft_routes = kvstore::rpc::ParseMembers(value); }
             else if (argument == "--mode") {
                 if (value == "new") { options.mode = kvstore::raft::StorageOpenMode::CreateNew; }
                 else if (value == "existing") { options.mode = kvstore::raft::StorageOpenMode::OpenExisting; }
                 else { throw std::invalid_argument(kUsage); }
             } else { throw std::invalid_argument(kUsage); }
         }
-        if (seen.size() != 4) { throw std::invalid_argument(kUsage); }
+        for (const auto* required : {"--id", "--directory", "--mode", "--members"}) {
+            if (seen.count(required) == 0) { throw std::invalid_argument(kUsage); }
+        }
         std::signal(SIGINT, StopSignal); std::signal(SIGTERM, StopSignal);
         kvstore::rpc::NodeServer node(options);
         std::cout << "Node " << options.id << " started. Ctrl+C stops it; reopen with --mode existing.\n" << std::flush;

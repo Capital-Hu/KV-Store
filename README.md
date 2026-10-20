@@ -4,7 +4,7 @@
 
 A persistent key-value store written in C++17, combining an LSM storage engine with three-node Raft replication over gRPC. Each node runs as an independent process and stores its own copy of the data.
 
-The project implements the storage and consensus layers directly, including WAL recovery, immutable SSTables, background flush and compaction, leader election, log replication, and committed-command application. It is a systems learning project under active development. The local three-node cluster includes a client library and CLI with commit-confirmed writes, log-barrier reads, leader discovery, and explicit handling of uncertain write outcomes. Systematic network fault experiments and performance benchmarks are planned.
+The project implements the storage and consensus layers directly, including WAL recovery, immutable SSTables, background flush and compaction, leader election, log replication, and committed-command application. It is a systems learning project under active development. The local three-node cluster includes a client library and CLI with commit-confirmed writes, log-barrier reads, leader discovery, and explicit handling of uncertain write outcomes. A local fault matrix exercises partitions, message loss/delay/duplication/reordering, and crash recovery. Performance benchmarks are planned.
 
 [Features](#features) · [Architecture](#architecture) · [Build and run](#build-and-run-locally) · [Testing](#testing) · [Scope](#scope-and-next-work)
 
@@ -18,7 +18,7 @@ The project implements the storage and consensus layers directly, including WAL 
 | Automatic background flush with WAL rotation and write backpressure | Log conflict repair and catch-up after a node rejoins |
 | Streaming background compaction and safe file reclamation | Committed operations applied in order to each local Store |
 | Per-table Bloom filters, in-memory block indexes, and a shared LRU block cache | gRPC transport, client library, and node/client/admin executables |
-| Manifest-based file publication and exclusive data-file ownership | Basic leader failover, process-crash recovery, and restart tests |
+| Manifest-based file publication and exclusive data-file ownership | Partition, message-fault, crash-recovery, and restart tests |
 
 ## Architecture
 
@@ -225,12 +225,20 @@ ctest --test-dir build/network --output-on-failure
 To run only the network tests:
 
 ```sh
-ctest --test-dir build/network -R '^grpc_' --output-on-failure
+ctest --test-dir build/network -R '^(grpc_.*|client_process|cluster_fault)$' --output-on-failure
 ```
 
-The current builds contain 19 and 22 CTest groups respectively. Coverage includes record corruption and truncation, WAL replay, manifest publication, tombstones, background-task interleavings, indexes and caching, Raft elections and conflict resolution, committed application, and process crashes. Network tests cover real KV replication, leader termination and re-election, node restart and catch-up, invalid RPCs, concurrent administration calls, and shutdown. Client tests additionally cover commit acknowledgements, quorum loss, read barriers, safe redirection, lost replies after real commits, and uncertain CLI outcomes. Tests create their own temporary data; network tests require permission to bind loopback ports and spawn child processes.
+The current builds contain 19 and 23 CTest groups respectively. Coverage includes record corruption and truncation, WAL replay, manifest publication, tombstones, background-task interleavings, indexes and caching, Raft elections and conflict resolution, committed application, and process crashes. Network tests cover real KV replication, leader termination and re-election, node restart and catch-up, invalid RPCs, concurrent administration calls, and shutdown. Client tests additionally cover commit acknowledgements, quorum loss, read barriers, safe redirection, lost replies after real commits, and uncertain CLI outcomes. The seven cluster fault scenarios additionally cover live-leader isolation, follower isolation, one-way loss, complete partition, two mixed message schedules, combined crash/restart, and route validation. Tests create their own temporary data; network tests require permission to bind loopback ports and spawn child processes.
 
-Both the ordinary and AddressSanitizer/UndefinedBehaviorSanitizer network builds have passed the full suite. Latest validation results and instrumentation limits are recorded in the [client implementation notes](docs/steps/17-client-semantics.md#测试). The earlier [directory reorganization](docs/steps/16a-project-layout.md) also records the thread checks and fresh-build verification performed at that stage. Test duration is not a throughput or latency benchmark.
+Both the ordinary and AddressSanitizer/UndefinedBehaviorSanitizer network builds have passed the full suite. Latest validation results and instrumentation limits are recorded in the [cluster fault notes](docs/steps/18-cluster-faults.md#验证结果与范围). The earlier [directory reorganization](docs/steps/16a-project-layout.md) also records the thread checks and fresh-build verification performed at that stage. Test duration is not a throughput or latency benchmark.
+
+To run the fault matrix alone, with scenario progress and message counters:
+
+```sh
+ctest --test-dir build/network -R '^cluster_fault$' -V --output-on-failure
+```
+
+It automatically starts three node processes and test-only forwarding endpoints on temporary ports, then cleans them up. Nodes optionally accept `--raft-routes MEMBERS` to route outbound Raft traffic through proxies; their listening and client addresses still come from `--members`. Normal startup needs no routing override. The fault scheduler is compiled only into the test executable.
 
 ## Project layout
 
@@ -257,10 +265,11 @@ The root `CMakeLists.txt` defines the core libraries, applications, and demos. E
 - The client implements consistent reads and commit-confirmed writes. Reads append NoOps; there is no request deduplication, automatic replay of uncertain writes, or exactly-once guarantee.
 - Transactions, MVCC, snapshots, Raft log truncation, and leveled compaction are not implemented. Store compaction reclaims SSTables; it does not compact the Raft log.
 - SSTable Bloom filters and block indexes are rebuilt in memory when tables open. Foreground Store operations currently share a coarse mutex, and writes synchronize the WAL individually.
-- Basic failover and process recovery are tested. A systematic network fault matrix and reproducible mixed-workload throughput and P50/P95/P99 benchmarks remain planned; no performance figures are claimed.
+- A finite local fault matrix now covers partitions, one-way loss, delayed/duplicated/reordered envelopes, crash recovery, and convergence. It is not an exhaustive history checker or a simulation of every TCP failure. Reproducible mixed-workload throughput and P50/P95/P99 benchmarks remain planned; no performance figures are claimed.
 
 ## Further reading
 
+- [Cluster fault matrix](docs/steps/18-cluster-faults.md): forwarding, scenarios, correctness checks, and validation limits.
 - [Client semantics and usage](docs/steps/17-client-semantics.md): leader discovery, write outcomes, consistent reads, and retries.
 - [System architecture](docs/architecture.md): module boundaries, replicated writes, persistence, and threads.
 - [Storage architecture](docs/storage-engine.md): local read/write paths, file lifecycle, locking, and recovery.

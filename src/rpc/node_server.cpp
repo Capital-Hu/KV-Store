@@ -35,6 +35,16 @@ raft::NodeConfig Validate(const ServerOptions& options) {
         if (member.id != options.id) { config.peers.push_back(member.id); }
     }
     if (ids.count(options.id) == 0) { throw std::invalid_argument("This node is absent from the member list"); }
+    if (!options.raft_routes.empty()) {
+        std::set<raft::NodeId> routed_ids; std::set<std::string> routed_addresses;
+        for (const auto& route : options.raft_routes) {
+            ValidateAddress(route.address);
+            if (!routed_ids.insert(route.id).second || !routed_addresses.insert(route.address).second) {
+                throw std::invalid_argument("Duplicate Raft route identity or address");
+            }
+        }
+        if (routed_ids != ids) { throw std::invalid_argument("Raft routes must name exactly the configured members"); }
+    }
     return config;
 }
 }  // namespace
@@ -59,7 +69,9 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
             grpc::ChannelArguments arguments;
             arguments.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
             arguments.SetMaxSendMessageSize(kMaxRpcBytes); arguments.SetMaxReceiveMessageSize(kMaxRpcBytes);
-            peer->stub = wire::RaftTransport::NewStub(grpc::CreateCustomChannel(member.address, grpc::InsecureChannelCredentials(), arguments));
+            auto endpoint = member.address;
+            for (const auto& route : options.raft_routes) { if (route.id == member.id) { endpoint = route.address; break; } }
+            peer->stub = wire::RaftTransport::NewStub(grpc::CreateCustomChannel(endpoint, grpc::InsecureChannelCredentials(), arguments));
             peers.push_back(std::move(peer));
         }
         grpc::ServerBuilder builder;

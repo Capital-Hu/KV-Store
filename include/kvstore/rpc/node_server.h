@@ -13,6 +13,9 @@ struct ServerOptions {
     ServerOptions();
     raft::NodeId id = 0;
     std::vector<Member> members;
+    // Optional outbound Raft endpoints, keyed by the same member IDs (e.g. test proxies).
+    // Listening and client/admin addresses continue to come from members.
+    std::vector<Member> raft_routes;
     std::string directory;
     raft::StorageOpenMode mode = raft::StorageOpenMode::OpenExisting;
     ReplicatedStoreOptions replica;

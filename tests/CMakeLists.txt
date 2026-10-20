@@ -109,6 +109,13 @@ if(KVSTORE_BUILD_GRPC)
     add_dependencies(client_process_test kvnode kvadmin kvclient)
     add_test(NAME client_process COMMAND client_process_test $<TARGET_FILE:kvnode> $<TARGET_FILE:kvadmin> $<TARGET_FILE:kvclient>)
     set_tests_properties(client_process PROPERTIES TIMEOUT 120)
+
+    add_executable(cluster_fault_test rpc/cluster_fault_test.cpp)
+    target_include_directories(cluster_fault_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(cluster_fault_test PRIVATE kvstore_client)
+    add_dependencies(cluster_fault_test kvnode kvadmin)
+    add_test(NAME cluster_fault COMMAND cluster_fault_test $<TARGET_FILE:kvnode> $<TARGET_FILE:kvadmin>)
+    set_tests_properties(cluster_fault PROPERTIES TIMEOUT 240)
 endif()
 
 # Keep the working directory used before the test sources were grouped by module.

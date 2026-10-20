@@ -126,18 +126,22 @@ std::array<std::string, 3> Addresses() {
 
 class Cluster {
 public:
-    explicit Cluster(bool start_all = true) : addresses(Addresses()) {
+    explicit Cluster(bool start_all = true,
+                     std::function<std::string(const std::array<std::string, 3>&)> route_factory = {}) : addresses(Addresses()) {
         for (std::size_t i = 0; i < 3; ++i) {
             if (i != 0) { members += ','; }
             members += std::to_string(i + 1) + '=' + addresses[i];
             stubs[i] = wire::NodeAdmin::NewStub(LocalChannel(addresses[i]));
         }
+        if (route_factory) { raft_routes = route_factory(addresses); }
         for (int i = 0; i < (start_all ? 3 : 1); ++i) { Start(i, "new"); }
         for (int i = 0; i < (start_all ? 3 : 1); ++i) { WaitUp(i); }
     }
     void Start(int node, const std::string& mode) {
-        children[node].Start({node_binary, "--id", std::to_string(node + 1), "--directory", directory.Path("node" + std::to_string(node + 1)),
-                             "--mode", mode, "--members", members}, directory.Path("node" + std::to_string(node + 1) + ".log"));
+        std::vector<std::string> arguments{node_binary, "--id", std::to_string(node + 1), "--directory", directory.Path("node" + std::to_string(node + 1)),
+                                           "--mode", mode, "--members", members};
+        if (!raft_routes.empty()) { arguments.insert(arguments.end(), {"--raft-routes", raft_routes}); }
+        children[node].Start(std::move(arguments), directory.Path("node" + std::to_string(node + 1) + ".log"));
     }
     void WaitUp(int node) {
         try { Until([&] { wire::NodeStatus status; return Inspect(node, status).ok(); }, "Node did not start"); }
@@ -189,6 +193,7 @@ public:
     Directory directory;
     std::array<std::string, 3> addresses;
     std::string members;
+    std::string raft_routes;
     std::array<std::unique_ptr<wire::NodeAdmin::Stub>, 3> stubs;
     std::array<Child, 3> children;
 };
