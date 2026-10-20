@@ -20,7 +20,9 @@ constexpr std::size_t kPeerQueueLimit = 16;
 
 raft::NodeConfig Validate(const ServerOptions& options) {
     if (options.id == 0 || options.members.size() != 3 || options.tick_interval.count() <= 0 ||
-        options.rpc_timeout.count() <= 0 || options.tick_interval >= options.replica.election.heartbeat_interval) {
+        options.rpc_timeout.count() <= 0 || options.client_wait_timeout.count() <= 0 ||
+        options.client_wait_timeout > std::chrono::seconds{30} ||
+        options.tick_interval >= options.replica.election.heartbeat_interval) {
         throw std::invalid_argument("Invalid node, membership or transport timing");
     }
     std::set<raft::NodeId> ids; std::set<std::string> addresses;
@@ -37,7 +39,7 @@ raft::NodeConfig Validate(const ServerOptions& options) {
 }
 }  // namespace
 
-struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::Service {
+struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::Service, wire::KeyValue::Service {
     struct Peer {
         raft::NodeId id;
         std::unique_ptr<wire::RaftTransport::Stub> stub;
@@ -66,6 +68,7 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
         builder.SetMaxReceiveMessageSize(kMaxRpcBytes); builder.SetMaxSendMessageSize(kMaxRpcBytes);
         builder.RegisterService(static_cast<wire::RaftTransport::Service*>(this));
         builder.RegisterService(static_cast<wire::NodeAdmin::Service*>(this));
+        builder.RegisterService(static_cast<wire::KeyValue::Service*>(this));
         int selected_port = 0;
         builder.AddListeningPort(address, grpc::InsecureServerCredentials(), &selected_port);
         server = builder.BuildAndStart();
@@ -80,6 +83,7 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
 
     void RequestStop() {
         stopping.store(true);
+        progress.notify_all();
         {
             std::lock_guard<std::mutex> lock(tick_mutex);
             tick_ready.notify_all();
@@ -101,6 +105,7 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
 
     // All callers hold state_mutex. Sender workers never hold this mutex during RPC.
     void Collect() {
+        progress.notify_all();
         for (const auto& message : replica->DrainMessages()) {
             for (auto& peer : peers) {
                 if (peer->id != message.to) { continue; }
@@ -221,8 +226,78 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
         catch (const std::exception& error) { Fail(error.what()); return {grpc::StatusCode::UNAVAILABLE, "Node failed"}; }
     }
 
+    // The caller keeps the lock object; wait releases it so replication can advance.
+    bool WaitApplied(std::unique_lock<std::mutex>& lock, grpc::ServerContext* context, raft::Proposal proposal) {
+        const auto deadline = std::chrono::steady_clock::now() + options.client_wait_timeout;
+        while (!stopping.load() && !context->IsCancelled()) {
+            if (replica->IsApplied(proposal)) { return true; }
+            const auto state = replica->status();
+            if (state.role != raft::Role::Leader || state.term != proposal.term ||
+                std::chrono::steady_clock::now() >= deadline) { return false; }
+            // Bounded waits also observe cancellation/stop without relying on a notification.
+            progress.wait_for(lock, options.tick_interval);
+        }
+        return false;
+    }
+
+    grpc::Status Write(grpc::ServerContext* context, const wire::Command* input, wire::WriteReply* output) override {
+        raft::Command command;
+        try { command = DecodeCommand(*input, false); }
+        catch (const std::invalid_argument& error) { return {grpc::StatusCode::INVALID_ARGUMENT, error.what()}; }
+        std::unique_lock<std::mutex> lock(state_mutex);
+        const auto ready = Ready(context); if (!ready.ok()) { return ready; }
+        bool attempted = false;
+        try {
+            const auto state = replica->status(); output->set_leader_id(state.leader_id.value_or(0));
+            if (state.role != raft::Role::Leader) { output->set_outcome(wire::CLIENT_NOT_LEADER); return grpc::Status::OK; }
+            if (client_waiters >= 64) { return {grpc::StatusCode::RESOURCE_EXHAUSTED, "Too many waiting client calls"}; }
+            ++client_waiters;
+            struct Slot { std::size_t& count; ~Slot() { --count; } } slot{client_waiters};
+            attempted = true;
+            const auto proposal = replica->Propose(std::move(command));
+            output->mutable_proposal()->set_index(proposal.index); output->mutable_proposal()->set_term(proposal.term);
+            Collect();
+            output->set_outcome(WaitApplied(lock, context, proposal) ? wire::CLIENT_OK : wire::CLIENT_UNKNOWN);
+            return grpc::Status::OK;
+        } catch (const std::exception& error) {
+            if (replica->usable()) {
+                if (attempted) { output->set_outcome(wire::CLIENT_UNKNOWN); return grpc::Status::OK; }
+                return {grpc::StatusCode::RESOURCE_EXHAUSTED, "Proposal could not be accepted"};
+            }
+            Fail(error.what()); return {grpc::StatusCode::UNAVAILABLE, "Node failed; write outcome unknown"};
+        }
+    }
+
+    grpc::Status Read(grpc::ServerContext* context, const wire::GetRequest* input, wire::ReadReply* output) override {
+        if (input->key().size() > raft::kMaxRaftCommandBytes) { return {grpc::StatusCode::INVALID_ARGUMENT, "Key too large"}; }
+        std::unique_lock<std::mutex> lock(state_mutex);
+        const auto ready = Ready(context); if (!ready.ok()) { return ready; }
+        try {
+            const auto state = replica->status(); output->set_leader_id(state.leader_id.value_or(0));
+            if (state.role != raft::Role::Leader) { output->set_outcome(wire::CLIENT_NOT_LEADER); return grpc::Status::OK; }
+            if (client_waiters >= 64) { return {grpc::StatusCode::RESOURCE_EXHAUSTED, "Too many waiting client calls"}; }
+            ++client_waiters;
+            struct Slot { std::size_t& count; ~Slot() { --count; } } slot{client_waiters};
+            const auto barrier = replica->ProposeReadBarrier(); Collect();
+            if (!WaitApplied(lock, context, barrier)) { output->set_outcome(wire::CLIENT_UNKNOWN); return grpc::Status::OK; }
+            const auto current = replica->status();
+            if (current.role != raft::Role::Leader || current.term != barrier.term) {
+                output->set_outcome(wire::CLIENT_NOT_LEADER); return grpc::Status::OK;
+            }
+            const auto value = replica->LocalGet(input->key());
+            output->mutable_result()->set_found(value.has_value());
+            if (value) { output->mutable_result()->set_value(*value); }
+            output->set_outcome(wire::CLIENT_OK); return grpc::Status::OK;
+        } catch (const std::exception& error) {
+            if (replica->usable()) { return {grpc::StatusCode::RESOURCE_EXHAUSTED, "Read barrier could not be accepted"}; }
+            Fail(error.what()); return {grpc::StatusCode::UNAVAILABLE, "Node failed"};
+        }
+    }
+
     ServerOptions options;
     std::mutex state_mutex;
+    std::condition_variable progress;
+    std::size_t client_waiters = 0;
     std::unique_ptr<ReplicatedStore> replica;
     std::vector<std::unique_ptr<Peer>> peers;
     std::unique_ptr<grpc::Server> server;

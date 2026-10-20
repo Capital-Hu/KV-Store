@@ -50,6 +50,8 @@ if(KVSTORE_BUILD_GRPC)
     target_link_libraries(kvnode PRIVATE kvstore_rpc)
     add_executable(kvadmin apps/kvadmin_main.cpp)
     target_link_libraries(kvadmin PRIVATE kvstore_rpc)
+    add_executable(kvclient apps/kvclient_main.cpp)
+    target_link_libraries(kvclient PRIVATE kvstore_client)
 endif()
 
 if(BUILD_TESTING)

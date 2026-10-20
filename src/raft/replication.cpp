@@ -40,6 +40,16 @@ Proposal Node::Propose(Command command) {
     if (command.type == CommandType::NoOp || !detail::ValidCommand(command)) {
         throw std::invalid_argument("Proposal must be a valid Put or Delete command");
     }
+    return AppendProposal(std::move(command));
+}
+
+Proposal Node::ProposeReadBarrier() {
+    EnsureUsable();
+    if (!storage_ || role_ != Role::Leader) { throw std::logic_error("Only a durable leader accepts a read barrier"); }
+    return AppendProposal({CommandType::NoOp, "", ""});
+}
+
+Proposal Node::AppendProposal(Command command) {
     const Proposal proposal{status().last_log_index + 1, status().term};
     try { storage_->Append({{proposal.index, proposal.term, std::move(command)}}); }
     catch (...) {

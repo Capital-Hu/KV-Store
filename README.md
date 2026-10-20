@@ -4,7 +4,7 @@
 
 A persistent key-value store written in C++17, combining an LSM storage engine with three-node Raft replication over gRPC. Each node runs as an independent process and stores its own copy of the data.
 
-The project implements the storage and consensus layers directly, including WAL recovery, immutable SSTables, background flush and compaction, leader election, log replication, and committed-command application. It is a systems learning project under active development. The local three-node cluster is working; a client API with consistent reads and retry semantics, systematic network fault experiments, and performance benchmarks are planned.
+The project implements the storage and consensus layers directly, including WAL recovery, immutable SSTables, background flush and compaction, leader election, log replication, and committed-command application. It is a systems learning project under active development. The local three-node cluster includes a client library and CLI with commit-confirmed writes, log-barrier reads, leader discovery, and explicit handling of uncertain write outcomes. Systematic network fault experiments and performance benchmarks are planned.
 
 [Features](#features) · [Architecture](#architecture) · [Build and run](#build-and-run-locally) · [Testing](#testing) · [Scope](#scope-and-next-work)
 
@@ -17,7 +17,7 @@ The project implements the storage and consensus layers directly, including WAL 
 | Ordered MemTables, immutable SSTables, and deletion tombstones | Leader election, heartbeats, and majority-based commits |
 | Automatic background flush with WAL rotation and write backpressure | Log conflict repair and catch-up after a node rejoins |
 | Streaming background compaction and safe file reclamation | Committed operations applied in order to each local Store |
-| Per-table Bloom filters, in-memory block indexes, and a shared LRU block cache | gRPC transport, node process, and command-line administration tool |
+| Per-table Bloom filters, in-memory block indexes, and a shared LRU block cache | gRPC transport, client library, and node/client/admin executables |
 | Manifest-based file publication and exclusive data-file ownership | Basic leader failover, process-crash recovery, and restart tests |
 
 ## Architecture
@@ -41,10 +41,10 @@ The diagram shows the component layout; the elected leader can be any node. `kva
 
 ### Replicated write path
 
-1. `kvadmin` submits a Put/Delete proposal to the leader.
-2. Raft persists the entry and replicates it to peers. A proposal receipt identifies the entry; it does **not** acknowledge a commit.
+1. `kvclient` discovers the leader and sends a Put/Delete through `KeyValue.Write`.
+2. Raft persists the entry and replicates it to peers. The client RPC waits while replication advances.
 3. Once Raft's majority and term rules allow the entry to commit, `ReplicatedStore` records the committed prefix and applies commands in order.
-4. Each local `Store` appends and synchronizes its own WAL, then updates its MemTable. Followers apply the entry after learning that it is committed.
+4. The local `Store` synchronizes its WAL and updates its MemTable before the client receives `OK`. Followers apply the entry after learning that it is committed. The diagnostic `kvadmin propose-put` still returns acceptance only.
 
 The **Raft log** records the replicated command history; the **Store WAL** recovers local MemTable state. They are separate persistence layers with different responsibilities.
 
@@ -58,7 +58,9 @@ MemTable reaches threshold -> freeze + switch WAL -> background SSTable flush
 SSTables reach threshold  -> background merge -> publish manifest -> reclaim old files
 ```
 
-Reads stop at the first value or tombstone, so older values cannot reappear after a delete. The manifest identifies the live SSTables and recovery WALs. File publication synchronizes a temporary manifest, renames it, and synchronizes the directory before obsolete files are removed.
+A client Get first commits and applies a fresh NoOp read barrier on the leader, then reads its local Store. Each read adds a log entry; there is no ReadIndex or lease optimization yet. Diagnostic `local-get` skips the barrier and may be stale.
+
+Local lookups stop at the first value or tombstone, so older values cannot reappear after a delete. The manifest identifies the live SSTables and recovery WALs. File publication synchronizes a temporary manifest, renames it, and synchronizes the directory before obsolete files are removed.
 
 Within a node, a state mutex serializes RPC and timer access to `ReplicatedStore`. Separate per-peer workers perform network sends without holding that mutex. The Store also has its own background flush and compaction workers.
 
@@ -157,7 +159,22 @@ Start one command in each of **three terminals**, with each terminal in the repo
 
 Use the same membership map on every node and a separate data directory for each. `--mode new` requires that the node directory does not already exist; create only the parent `build/cluster`. For a previously initialized node, use `--mode existing` with the same identity and data directory.
 
-In a fourth terminal, inspect the election result:
+In a fourth terminal, use the client without choosing a leader address:
+
+```sh
+cluster_members='1=127.0.0.1:50051,2=127.0.0.1:50052,3=127.0.0.1:50053'
+./build/network/kvclient "$cluster_members" put name Alice
+./build/network/kvclient "$cluster_members" get name
+./build/network/kvclient "$cluster_members" delete name
+./build/network/kvclient "$cluster_members" --timeout-ms 3000 get name
+```
+
+Successful writes print `OK index=N term=T` only after commitment and local application. A missing Get prints `<not found>` and exits with code 3. Reads use a fresh majority-backed log barrier; they never fall back to a stale local read.
+
+Write uncertainty prints `UNKNOWN` and exits with code 4. A timeout does not undo a write. The client retries writes only after an explicit pre-proposal `NOT_LEADER` rejection, with gRPC built-in retries disabled. It never automatically replays a possibly accepted write. If no leader operation can be attempted within the budget, the exit code is 1. Argument errors use code 2; successful operations use code 0. There is no request deduplication or exactly-once guarantee. See [client semantics](docs/steps/17-client-semantics.md) for API results, deadlines, and limitations.
+
+For diagnostics, inspect the election result with `kvadmin`:
+
 
 ```sh
 ./build/network/kvadmin 127.0.0.1:50051 status
@@ -211,9 +228,9 @@ To run only the network tests:
 ctest --test-dir build/network -R '^grpc_' --output-on-failure
 ```
 
-The current builds contain 19 and 21 CTest groups respectively. Coverage includes record corruption and truncation, WAL replay, manifest publication, tombstones, background-task interleavings, indexes and caching, Raft elections and conflict resolution, committed application, and process crashes. Network tests cover real KV replication, leader termination and re-election, node restart and catch-up, invalid RPCs, concurrent administration calls, and shutdown. Tests create their own temporary data; network tests require permission to bind loopback ports and spawn child processes.
+The current builds contain 19 and 22 CTest groups respectively. Coverage includes record corruption and truncation, WAL replay, manifest publication, tombstones, background-task interleavings, indexes and caching, Raft elections and conflict resolution, committed application, and process crashes. Network tests cover real KV replication, leader termination and re-election, node restart and catch-up, invalid RPCs, concurrent administration calls, and shutdown. Client tests additionally cover commit acknowledgements, quorum loss, read barriers, safe redirection, lost replies after real commits, and uncertain CLI outcomes. Tests create their own temporary data; network tests require permission to bind loopback ports and spawn child processes.
 
-Both the ordinary and AddressSanitizer/UndefinedBehaviorSanitizer network builds have passed the full suite. Validation details and instrumentation limits are recorded in the [network implementation notes](docs/steps/16-grpc-processes.md#验证入口). The complete suites were rerun after the [directory reorganization](docs/steps/16a-project-layout.md), together with the existing thread checks and a fresh build. Test duration is not a throughput or latency benchmark.
+Both the ordinary and AddressSanitizer/UndefinedBehaviorSanitizer network builds have passed the full suite. Latest validation results and instrumentation limits are recorded in the [client implementation notes](docs/steps/17-client-semantics.md#测试). The earlier [directory reorganization](docs/steps/16a-project-layout.md) also records the thread checks and fresh-build verification performed at that stage. Test duration is not a throughput or latency benchmark.
 
 ## Project layout
 
@@ -222,9 +239,9 @@ include/kvstore/     Public engine, Raft, replication, and RPC interfaces
 src/engine/         LSM engine, local recovery, background flush and compaction
 src/raft/           Raft state machine, replication, and persistent log
 src/replica/        Raft-to-Store coordinator and commit checkpoint
-src/rpc/            gRPC runtime, codec, configuration, and optional CMake rules
+src/rpc/            gRPC runtime, client, codec, configuration, and optional CMake rules
 src/common/         Internal file I/O and byte-encoding helpers
-apps/               kvstore, kvnode, and kvadmin entry points
+apps/               kvstore, kvnode, kvadmin, and kvclient entry points
 examples/           In-process Raft and replicated Store demos
 proto/              Protobuf message and service definitions
 tests/              Tests grouped into engine/, raft/, replica/, and rpc/
@@ -237,13 +254,14 @@ The root `CMakeLists.txt` defines the core libraries, applications, and demos. E
 ## Scope and next work
 
 - The network runtime currently supports exactly three static members on `127.0.0.1`, using plaintext gRPC without authentication.
-- Consistent client reads, leader discovery, write retry/deduplication semantics, and a formal client API are pending.
+- The client implements consistent reads and commit-confirmed writes. Reads append NoOps; there is no request deduplication, automatic replay of uncertain writes, or exactly-once guarantee.
 - Transactions, MVCC, snapshots, Raft log truncation, and leveled compaction are not implemented. Store compaction reclaims SSTables; it does not compact the Raft log.
 - SSTable Bloom filters and block indexes are rebuilt in memory when tables open. Foreground Store operations currently share a coarse mutex, and writes synchronize the WAL individually.
 - Basic failover and process recovery are tested. A systematic network fault matrix and reproducible mixed-workload throughput and P50/P95/P99 benchmarks remain planned; no performance figures are claimed.
 
 ## Further reading
 
+- [Client semantics and usage](docs/steps/17-client-semantics.md): leader discovery, write outcomes, consistent reads, and retries.
 - [System architecture](docs/architecture.md): module boundaries, replicated writes, persistence, and threads.
 - [Storage architecture](docs/storage-engine.md): local read/write paths, file lifecycle, locking, and recovery.
 - [Directory reorganization](docs/steps/16a-project-layout.md): old-to-new paths and regression results.

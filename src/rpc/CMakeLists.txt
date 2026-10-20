@@ -25,3 +25,7 @@ add_library(kvstore_rpc STATIC node_server.cpp protocol_codec.cpp config.cpp)
 target_include_directories(kvstore_rpc PUBLIC "${PROJECT_SOURCE_DIR}/include")
 target_compile_features(kvstore_rpc PUBLIC cxx_std_17)
 target_link_libraries(kvstore_rpc PUBLIC kvstore_replica kvstore_proto)
+
+add_library(kvstore_client STATIC client.cpp)
+target_include_directories(kvstore_client PUBLIC "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(kvstore_client PUBLIC kvstore_rpc)

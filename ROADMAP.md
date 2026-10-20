@@ -53,12 +53,14 @@ WAL 是恢复用的追加日志，SSTable 是查询用的不可变有序文件�
 | 15，已完成 | 已提交操作接入 Store | 持久提交依据、顺序执行、完整前缀恢复重放、实际 KV 对照、12 个强杀及 1 次真实部分写入 |
 | 16，已完成 | gRPC 与三个真实进程 | 独立目录和端口组成集群，实际 KV 复制、基本强杀切换/重开追赶、并发 RPC、不可达节点与关闭 |
 | 16a，已完成 | 按模块整理源码、程序入口、演示和测试，补齐总体架构 | 原有 19/21 组测试及 ASan/UBSan 回归通过，既有线程检查和全新目录构建通过；见[目录整理记录](docs/steps/16a-project-layout.md) |
-| 17 | 客户端与查询语义 | leader 发现、超时/重试语义与查询一致性 |
+| 17，已完成 | Client/kvclient、Leader 发现、提交确认、NoOp 读屏障、总期限及安全重试 | 默认 19 组、普通与 ASan/UBSan 网络 22 组通过；含真实提交后丢回复、无多数派拒绝旧读、故障切换与并发；见[客户端说明](docs/steps/17-client-semantics.md) |
 | 18 | 集群故障验证 | leader 故障、节点重启、网络隔离、延迟与丢消息 |
 | 19 | 混合负载 benchmark | 可重复的吞吐量、P50/P95/P99、参数和环境 |
 
 每一步继续先讨论设计和故障边界，再实现验证；复杂步骤可再拆小。协议测试先使用可控的时间和模拟消息交付，第 16 步已接入本机真实网络进程。已完成说明见 [第 11 步基础模型](docs/steps/11-raft-model.md)、[第 12 步持久化](docs/steps/12-raft-storage.md)、[第 13 步选举/心跳](docs/steps/13-raft-election.md)、[第 14 步复制/提交](docs/steps/14-raft-replication.md)、[第 15 步 Store 接入](docs/steps/15-raft-store.md) 和 [第 16 步 gRPC/真实进程](docs/steps/16-grpc-processes.md)。
 
-Raft 日志与 Store WAL 分别负责复制顺序和本机恢复。当前已通过连接层执行到 Store；先保存提交依据，重开后重放完整已保存提交前缀。该策略依赖 Put/Delete 的最终状态幂等性，会重复写 Store WAL，未承诺 exactly-once 或事务。客户端成功与重试、查询一致性仍需后续明确；Propose 返回本地提议位置，不代表客户端成功，LocalGet 可能是旧数据。Raft 持久日志暂不物理压缩，逻辑条目有容量限制，见第 12 步。
+Raft 日志与 Store WAL 分别负责复制顺序和本机恢复。当前已通过连接层执行到 Store；先保存提交依据，重开后重放完整已保存提交前缀。该策略依赖 Put/Delete 的最终状态幂等性，会重复写 Store WAL，未承诺 exactly-once 或事务。第 17 步已明确正式客户端语义：写入在提交并执行后成功，Get 使用新 NoOp 屏障，不确定写入不自动重放。管理 Propose 仍返回本地提议位置，不代表客户端成功，LocalGet 可能是旧数据。Raft 持久日志暂不物理压缩，逻辑条目有容量限制，见第 12 步。
 
 第 16 步的 kvadmin 是单次管理观察工具，辅助验证独立进程中的节点，不自动发现 Leader、重试写入或提供一致性读。网络实现限定可信本机回环地址，依赖单独构建在 build/deps；默认不启用 gRPC 时仍可独立构建前面的全部模块。
+
+第 17 步的 Client/kvclient 自动探测 Leader，只在明确的提交前拒绝后重试写入；所有业务写入 RPC 错误保守地归为 Unknown。每次一致性读取追加一条 NoOp，没有 ReadIndex、租约读、请求去重或 Raft 日志截断。下一步为第 18 步系统性集群故障验证，本轮不提前实现。

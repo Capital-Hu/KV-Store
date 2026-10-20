@@ -212,6 +212,26 @@ void TestNoOpAndMajorityCommit() {
           cluster.nodes[3]->status().commit_index == 1, "One unavailable follower does not prevent majority commit");
 }
 
+void TestReadBarriersRequireFreshMajorityAndSurviveRestart() {
+    Cluster cluster;
+    Reject([&] { cluster.nodes[1]->ProposeReadBarrier(); }, "Follower cannot fence a read");
+    cluster.Start(); cluster.DeliverAll();
+    const auto previous = cluster.nodes[1]->status().commit_index;
+    cluster.isolated.insert(1);
+    const auto barrier = cluster.nodes[1]->ProposeReadBarrier(); cluster.Collect(1); cluster.DeliverAll();
+    Check(barrier.index == previous + 1 && cluster.nodes[1]->status().commit_index == previous,
+          "Earlier quorum acknowledgements cannot commit a fresh read barrier");
+    const auto& entry = cluster.nodes[1]->persistent_state().log.back();
+    Check(entry.command.type == raft::CommandType::NoOp && entry.command.key.empty() && entry.command.value.empty(),
+          "Read barrier uses the existing NoOp disk format");
+    cluster.isolated.clear(); cluster.Advance(1, 20ms); cluster.DeliverAll();
+    Check(cluster.nodes[1]->status().commit_index == barrier.index, "Fresh majority commits barrier");
+    cluster.Restart(1);
+    Check(cluster.nodes[1]->persistent_state().log.back().command.type == raft::CommandType::NoOp,
+          "Read barrier survives reopening the Raft log");
+    Reject([&] { cluster.nodes[1]->ProposeReadBarrier(); }, "Reopened follower must regain leadership");
+}
+
 void TestCommittedCursorOwnsItsEntries() {
     Cluster cluster; cluster.Start(); cluster.Put(1, "k", "v"); cluster.DeliverAll();
     auto copy = cluster.nodes[1]->CommittedEntries(1);
@@ -529,6 +549,7 @@ void TestMixedCommandsUnderMessageFaultsAndRestarts() {
 int main() {
     try {
         TestLeaderOnlyAndInvalidProposals(); TestNoOpAndMajorityCommit(); TestCommittedCursorOwnsItsEntries();
+        TestReadBarriersRequireFreshMajorityAndSurviveRestart();
         TestFollowerChecksPrefix(); TestDuplicatesAndShortRequestsRetainSuffix(); TestConflictReplacesOnlySuffix();
         TestCommittedAndSameTermConflictsStopNode(); TestMalformedAppendsAreIgnored();
         TestResponseCorrelationAndDuplicateRejection(); TestRetryPreservesRequestAndAcceptsDelayedReply();
@@ -536,7 +557,7 @@ int main() {
         TestMinorityCannotCommitAndRejoinRepairsConflict(); TestRestartReestablishesCommitWithoutNewClientCommand();
         TestPersistenceFailuresReleaseNoAcknowledgement(); TestProcessCrashAfterSyncBeforeOutput();
         TestMixedCommandsUnderMessageFaultsAndRestarts();
-        std::cout << "All 17 Raft replication tests passed (2 persistence-boundary process crashes).\n";
+        std::cout << "All 18 Raft replication tests passed (2 persistence-boundary process crashes).\n";
     } catch (const std::exception& error) {
         std::cerr << "Raft replication test failed: " << error.what() << '\n'; return 1;
     }

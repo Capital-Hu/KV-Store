@@ -4,7 +4,7 @@
 
 一个使用 C++17 实现的持久化键值存储，将 LSM 存储引擎与基于 gRPC 的三节点 Raft 复制结合起来。每个节点作为独立进程运行，保存自己的数据副本。
 
-项目直接实现存储与共识的核心逻辑，包括 WAL 恢复、不可变 SSTable、后台刷盘与合并、选主、日志复制及已提交命令的执行。目前本机三节点集群已可运行；项目仍在开发中，后续将补充一致性读取与重试等客户端语义、系统性网络故障实验和性能测试。
+项目直接实现存储与共识的核心逻辑，包括 WAL 恢复、不可变 SSTable、后台刷盘与合并、选主、日志复制及已提交命令的执行。目前本机三节点集群已可运行，包含客户端库和命令行工具，提供提交确认、一致性读屏障、Leader 发现及明确的写入未知结果语义。项目仍在开发中，后续将补充系统性网络故障实验和性能测试。
 
 [功能](#功能) · [架构](#架构) · [构建与运行](#构建与本地运行) · [测试](#测试) · [当前范围](#当前范围与后续工作)
 
@@ -17,7 +17,7 @@
 | 有序 MemTable、不可变 SSTable、删除标记 | Leader 选举、心跳与多数派提交 |
 | 自动后台刷盘、WAL 轮换和写入背压 | 日志冲突修正及节点重新加入后的追赶 |
 | 流式后台合并和安全文件回收 | 已提交命令按顺序应用到各节点的本地 Store |
-| 每表 Bloom 过滤器、内存块索引、共享 LRU 块缓存 | gRPC 传输、节点进程和命令行管理工具 |
+| 每表 Bloom 过滤器、内存块索引、共享 LRU 块缓存 | gRPC 传输、客户端库及节点／客户端／管理程序 |
 | 基于 manifest 的文件发布和数据文件独占打开 | 基本 Leader 故障切换、进程崩溃与重启测试 |
 
 ## 架构
@@ -41,10 +41,10 @@ flowchart LR
 
 ### 复制写入流程
 
-1. `kvadmin` 向 Leader 提交 Put/Delete 提议。
-2. Raft 持久化日志条目并复制给其他节点。提议回执用于标识该条目，**不表示已经提交**。
+1. `kvclient` 自动发现 Leader，通过 `KeyValue.Write` 提交 Put/Delete。
+2. Raft 持久化日志条目并复制给其他节点；客户端 RPC 释放状态锁等待复制推进。
 3. 满足 Raft 的多数派与任期规则后，`ReplicatedStore` 保存已提交前缀的依据，并按顺序执行命令。
-4. 各节点的本地 `Store` 追加并同步自己的 WAL，再更新 MemTable。Follower 得知条目已提交后也会执行。
+4. 本地 `Store` 同步 WAL 并更新 MemTable 后，客户端才收到 `OK`。Follower 得知条目已提交后也会执行。管理工具 `kvadmin propose-put` 仍只返回接收提议的回执。
 
 **Raft 日志**记录需要复制的命令历史，**Store WAL**用于恢复本地 MemTable。两者是职责不同的持久化层。
 
@@ -58,7 +58,9 @@ MemTable 达到阈值 → 冻结并切换 WAL → 后台刷出 SSTable
 SSTable 达到数量阈值 → 后台合并 → 发布 manifest → 回收旧文件
 ```
 
-查询遇到第一个值或删除标记就停止，避免删除后读出旧值。manifest 指定有效的 SSTable 和用于恢复的 WAL。发布文件状态时，先同步临时 manifest，再替换正式文件并同步目录，之后才能回收旧文件。
+正式客户端 Get 先在 Leader 上提交并执行一条新的 NoOp 读屏障，再查询本地 Store。每次读都会增加一条日志，目前没有 ReadIndex 或租约读取优化。管理工具的 `local-get` 跳过屏障，可能读到旧数据。
+
+本地查询遇到第一个值或删除标记就停止，避免删除后读出旧值。manifest 指定有效的 SSTable 和用于恢复的 WAL。发布文件状态时，先同步临时 manifest，再替换正式文件并同步目录，之后才能回收旧文件。
 
 节点内的一把状态锁串行保护 RPC 回调和计时线程对 `ReplicatedStore` 的访问。每个对端有独立发送线程，网络发送期间不持有这把锁。Store 内部另有后台刷盘和合并线程。
 
@@ -157,7 +159,22 @@ mkdir -p build/cluster
 
 所有节点使用相同的成员映射，各自使用独立数据目录。`--mode new` 要求节点目录尚不存在，因此只提前创建父目录 `build/cluster`。已经初始化过的节点应使用 `--mode existing`，并保留原节点身份和数据目录。
 
-在第四个终端查看选举结果：
+在第四个终端使用客户端，不需要先选择 Leader 的地址：
+
+```sh
+cluster_members='1=127.0.0.1:50051,2=127.0.0.1:50052,3=127.0.0.1:50053'
+./build/network/kvclient "$cluster_members" put name Alice
+./build/network/kvclient "$cluster_members" get name
+./build/network/kvclient "$cluster_members" delete name
+./build/network/kvclient "$cluster_members" --timeout-ms 3000 get name
+```
+
+写入只有提交并在本节点执行完成后才输出 `OK index=N term=T`。Get 不存在时输出 `<not found>`，退出码为 3。读取使用新的多数派日志屏障，不会退回可能过期的本地查询。
+
+写入结果未知时输出 `UNKNOWN`，退出码为 4；超时不撤销写入。只有明确的“尚未追加提议”的 `NOT_LEADER` 回复才允许自动换节点重试，并关闭 gRPC 内置重试。可能已经接受的写入不会自动重放。总期限内未能发起可用的 Leader 操作时退出码为 1，参数错误为 2，成功为 0。当前没有请求去重或 exactly-once 保证。API 结果、期限和边界见[客户端语义](docs/steps/17-client-semantics.md)。
+
+需要诊断时，使用 `kvadmin` 查看选举结果：
+
 
 ```sh
 ./build/network/kvadmin 127.0.0.1:50051 status
@@ -211,9 +228,9 @@ ctest --test-dir build/network --output-on-failure
 ctest --test-dir build/network -R '^grpc_' --output-on-failure
 ```
 
-当前两种构建分别包含 19 和 21 组 CTest。覆盖记录损坏与截断、WAL 回放、manifest 发布、删除标记、后台任务交错、索引和缓存、Raft 选举与冲突修正、提交执行及进程崩溃。网络测试覆盖真实 KV 复制、Leader 被终止后重选、节点重启追赶、非法 RPC、并发管理调用及关闭。测试使用独立临时数据；网络测试需要允许绑定回环端口和启动子进程。
+当前两种构建分别包含 19 和 22 组 CTest。覆盖记录损坏与截断、WAL 回放、manifest 发布、删除标记、后台任务交错、索引和缓存、Raft 选举与冲突修正、提交执行及进程崩溃。网络测试覆盖真实 KV 复制、Leader 被终止后重选、节点重启追赶、非法 RPC、并发管理调用及关闭。客户端测试还覆盖提交确认、失去多数派、读屏障、安全重定向、实际提交后的回复丢失及 CLI 未知结果。测试使用独立临时数据；网络测试需要允许绑定回环端口和启动子进程。
 
-普通网络构建和 AddressSanitizer/UndefinedBehaviorSanitizer 构建均已通过完整测试。验证记录和插桩范围见[网络实现说明](docs/steps/16-grpc-processes.md#验证入口)。[目录整理](docs/steps/16a-project-layout.md)后已重新运行完整测试、既有线程检查，并验证全新目录构建。测试耗时不等于吞吐量或延迟 benchmark。
+普通网络构建和 AddressSanitizer/UndefinedBehaviorSanitizer 构建均已通过完整测试。最新验证记录和插桩范围见[客户端实现说明](docs/steps/17-client-semantics.md#测试)。此前[目录整理](docs/steps/16a-project-layout.md)记录了当时完成的线程检查和全新目录构建验证。测试耗时不等于吞吐量或延迟 benchmark。
 
 ## 项目结构
 
@@ -222,9 +239,9 @@ include/kvstore/     存储引擎、Raft、复制协调层及 RPC 的公开接�
 src/engine/         LSM 引擎、本地恢复、后台刷盘与合并
 src/raft/           Raft 状态机、复制及持久化日志
 src/replica/        Raft 与 Store 的协调层及提交记录
-src/rpc/            gRPC 运行层、编解码、配置和可选构建规则
+src/rpc/            gRPC 运行层、客户端、编解码、配置和可选构建规则
 src/common/         内部文件操作和字节编码工具
-apps/               kvstore、kvnode、kvadmin 的程序入口
+apps/               kvstore、kvnode、kvadmin、kvclient 的程序入口
 examples/           进程内的 Raft 和复制存储演示
 proto/              Protobuf 消息和服务定义
 tests/              按 engine/、raft/、replica/、rpc/ 分组的测试
@@ -237,13 +254,14 @@ docs/               架构说明和逐步实现讲解，使用中文
 ## 当前范围与后续工作
 
 - 网络运行层目前支持三个静态成员，仅接受 `127.0.0.1` 地址，使用无认证的明文 gRPC。
-- 一致性客户端读取、Leader 发现、写入重试与去重语义，以及正式客户端 API 尚待实现。
+- 客户端已提供一致性读取和提交确认。每次读取追加 NoOp；暂不提供请求去重、不确定写入的自动重放或 exactly-once 保证。
 - 暂无事务、MVCC、快照、Raft 日志截断及分层合并。Store 的 compaction 回收 SSTable，不负责压缩 Raft 日志。
 - SSTable 的 Bloom 过滤器和块索引在打开文件时重建到内存。Store 的前台操作目前共用一把较大粒度的锁，每条写入单独同步 WAL。
 - 已验证基本故障切换和进程恢复；系统性网络故障矩阵、可复现的混合负载吞吐量及 P50/P95/P99 延迟测试仍在计划中，目前不提供性能数字。
 
 ## 延伸阅读
 
+- [客户端语义与使用](docs/steps/17-client-semantics.md)：Leader 发现、写入结果、一致性读取与重试。
 - [总体架构](docs/architecture.md)：模块职责、复制写入、持久化与线程。
 - [单机存储架构](docs/storage-engine.md)：本地读写路径、文件生命周期、锁与恢复。
 - [目录整理记录](docs/steps/16a-project-layout.md)：旧新路径对照和回归验证结果。

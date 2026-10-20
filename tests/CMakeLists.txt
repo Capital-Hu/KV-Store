@@ -102,6 +102,13 @@ if(KVSTORE_BUILD_GRPC)
     add_dependencies(grpc_process_test kvnode kvadmin)
     add_test(NAME grpc_process COMMAND grpc_process_test $<TARGET_FILE:kvnode> $<TARGET_FILE:kvadmin>)
     set_tests_properties(grpc_process PROPERTIES TIMEOUT 120)
+
+    add_executable(client_process_test rpc/client_process_test.cpp)
+    target_include_directories(client_process_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(client_process_test PRIVATE kvstore_client)
+    add_dependencies(client_process_test kvnode kvadmin kvclient)
+    add_test(NAME client_process COMMAND client_process_test $<TARGET_FILE:kvnode> $<TARGET_FILE:kvadmin> $<TARGET_FILE:kvclient>)
+    set_tests_properties(client_process PROPERTIES TIMEOUT 120)
 endif()
 
 # Keep the working directory used before the test sources were grouped by module.

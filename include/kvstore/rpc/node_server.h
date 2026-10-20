@@ -18,6 +18,7 @@ struct ServerOptions {
     ReplicatedStoreOptions replica;
     std::chrono::milliseconds tick_interval{10};
     std::chrono::milliseconds rpc_timeout{150};
+    std::chrono::milliseconds client_wait_timeout{1000};
 };
 
 // Local, trusted three-process transport. Internally serializes all Replica calls.

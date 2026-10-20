@@ -28,6 +28,7 @@ public:
     bool usable() const;
     raft::NodeStatus status() const;
     raft::Proposal Propose(raft::Command command);
+    raft::Proposal ProposeReadBarrier();
     void Step(const raft::Message& message);
     void AdvanceTime(std::chrono::milliseconds elapsed);
     std::vector<raft::Message> DrainMessages();

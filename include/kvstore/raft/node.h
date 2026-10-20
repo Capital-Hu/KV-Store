@@ -65,6 +65,8 @@ public:
     void Step(const Message& message);
     std::vector<Message> DrainMessages();
     Proposal Propose(Command command);
+    // Append a fresh NoOp whose majority commitment can fence a client read.
+    Proposal ProposeReadBarrier();
     // Owned committed prefix after the caller's cursor; this does not apply entries.
     std::vector<LogEntry> CommittedEntries(LogIndex after = 0) const;
     // Acknowledge exactly the next entry, only after successful state-machine application.
@@ -94,6 +96,7 @@ private:
     void SendHeartbeats();
     void SendAppend(Peer& peer, bool retry = false);
     void AdvanceCommit();
+    Proposal AppendProposal(Command command);
     std::uint64_t NextRpcId();
     void Handle(const Message& message, const RequestVoteRequest& request);
     void Handle(const Message& message, const RequestVoteResponse& response);

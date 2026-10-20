@@ -95,3 +95,24 @@ service NodeAdmin {
   rpc LocalGet(GetRequest) returns (GetResponse);
   rpc Applied(Proposal) returns (AppliedResponse);
 }
+
+enum ClientOutcome {
+  CLIENT_UNSPECIFIED = 0;
+  CLIENT_OK = 1;
+  CLIENT_NOT_LEADER = 2; // Rejected before any proposal was appended.
+  CLIENT_UNKNOWN = 3; // May have committed; never automatically retry a write.
+}
+message WriteReply {
+  ClientOutcome outcome = 1;
+  uint64 leader_id = 2;
+  Proposal proposal = 3;
+}
+message ReadReply {
+  ClientOutcome outcome = 1;
+  uint64 leader_id = 2;
+  GetResponse result = 3;
+}
+service KeyValue {
+  rpc Write(Command) returns (WriteReply);
+  rpc Read(GetRequest) returns (ReadReply);
+}

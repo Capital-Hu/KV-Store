@@ -11,7 +11,7 @@
 | `src/replica/` | 将已提交日志应用到 Store，保存恢复依据 | `replicated_store.cpp`、`replica_checkpoint.cpp` |
 | `src/rpc/` | 消息转换、网络服务、计时、发送线程和生命周期 | `node_server.cpp`、`protocol_codec.cpp`、`config.cpp` |
 | `src/common/` | 共享的内部文件操作和编码 | `file_io.h/.cpp`、`coding.h` |
-| `apps/` | 命令行参数解析及程序入口 | `kvstore_main.cpp`、`kvnode_main.cpp`、`kvadmin_main.cpp` |
+| `apps/` | 命令行参数解析及程序入口 | `kvstore_main.cpp`、`kvnode_main.cpp`、`kvadmin_main.cpp`、`kvclient_main.cpp` |
 | `examples/` | 进程内模拟消息交付的演示 | `raft_demo.cpp`、`replica_demo.cpp` |
 | `tests/` | 按 engine、raft、replica、rpc 分组的验证 | 各模块的 `*_test.cpp` |
 
@@ -25,6 +25,7 @@ raft_demo     → Raft
 replica_demo  → ReplicatedStore → Raft + 存储引擎
 kvnode        → gRPC 运行层 → ReplicatedStore → Raft + 存储引擎
 kvadmin       → 管理 RPC 的客户端，连接明确指定的节点
+kvclient      → 自动发现 Leader，等待写入执行，通过读屏障查询
 ```
 
 `kvnode` 不会再启动一个 `kvstore` 子进程。每个节点内的网络服务、Raft 和 Store 都属于同一进程。
@@ -48,14 +49,14 @@ flowchart LR
 
 ## 一次写入的路径
 
-1. 管理工具向 Leader 的 `Propose` RPC 提交 Put/Delete。
+1. 正式客户端向 Leader 的 `KeyValue.Write` RPC 提交 Put/Delete；管理工具也可直接调用 `Propose` 观察提议。
 2. `ReplicatedStore` 调用 Raft，将命令写入本地复制日志，产生待发送消息。
 3. 运行层提取消息并交给各 peer 的发送队列，通过 gRPC 发给其他节点。
 4. Follower 持久化后产生 Raft 回复；回复通过反方向的独立消息返回。
 5. Leader 按多数派与任期规则推进提交位置，协调层先同步保存 COMMIT 记录，再顺序调用本地 Store。
 6. Store 追加并同步自己的 WAL，更新 MemTable；Follower 在得知提交位置后执行相同命令。
 
-`Propose` 返回的 `(index, term)` 是提议标识，不是提交成功通知。`applied` 用这个标识检查指定节点是否已经执行对应条目。一次消息交付 RPC 返回成功，也不能作为 Raft 的多数派确认。
+`KeyValue.Write` 等待提交及本地执行完成才返回成功。管理 `Propose` 返回的 `(index, term)` 是提议标识，不是提交成功通知。`applied` 用这个标识检查指定节点是否已经执行对应条目。一次消息交付 RPC 返回成功，也不能作为 Raft 的多数派确认。
 
 ## 三种持久化信息
 
@@ -79,7 +80,7 @@ flowchart LR
                     Bloom → 块索引 → 缓存或文件 → 精确比较
 ```
 
-遇到值或删除标记就结束查找。Follower 和被隔离的旧 Leader 都可能提供旧数据；当前没有一致性客户端读接口。
+遇到值或删除标记就结束查找。Follower 和被隔离的旧 Leader 都可能提供旧数据；正式 Client.Get 则在当前 Leader 上追加并等待一条新的 NoOp 屏障，再在同一把节点锁内检查任期与角色并读取本地 Store；没有多数派时不会返回旧值。具体流程见[第 17 步](steps/17-client-semantics.md)。
 
 Store 的后台刷盘将冻结 MemTable 转为 SSTable，再发布 manifest 并回收对应旧 WAL。后台合并整理多个 SSTable，发布替换后的文件集合，再回收旧表。这些操作不会压缩 Raft 日志。完整细节见[单机存储架构](storage-engine.md)。
 
@@ -101,4 +102,4 @@ Store 的后台刷盘将冻结 MemTable 转为 SSTable，再发布 manifest 并�
 
 可执行文件输出到所选构建目录根部，Protobuf 生成文件仍放在该构建目录的 `src/rpc/generated/`。常用构建、三节点启动和测试命令见[中文 README](../README.zh-CN.md)或[英文 README](../README.md)。
 
-当前完成第 16 阶段；客户端语义、系统性网络故障验证和性能测试仍待后续步骤。目录迁移和验证记录见[第 16a 步](steps/16a-project-layout.md)。
+当前客户端语义已接入，系统性网络故障验证和性能测试仍待后续步骤。写入未知结果不自动重发，没有请求去重；每次正式读取会增加一条 Raft 日志。目录迁移和验证记录见[第 16a 步](steps/16a-project-layout.md)。

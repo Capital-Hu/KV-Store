@@ -140,6 +140,15 @@ void ReplicatedStore::Step(const raft::Message& message) {
     try { node_->Step(message); ApplyCommitted(); } catch (...) { usable_ = false; throw; }
 }
 
+raft::Proposal ReplicatedStore::ProposeReadBarrier() {
+    EnsureUsable();
+    raft::Proposal result;
+    try { result = node_->ProposeReadBarrier(); }
+    catch (...) { if (!node_->usable()) { usable_ = false; } throw; }
+    try { ApplyCommitted(); } catch (...) { usable_ = false; throw; }
+    return result;
+}
+
 void ReplicatedStore::AdvanceTime(std::chrono::milliseconds elapsed) {
     EnsureUsable();
     try { node_->AdvanceTime(elapsed); }
