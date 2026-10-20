@@ -2,11 +2,11 @@
 
 [English](README.md) | **简体中文**
 
-一个使用 C++17 实现的持久化键值存储，将 LSM 存储引擎与基于 gRPC 的三节点 Raft 复制结合起来。每个节点作为独立进程运行，保存自己的数据副本。
+一个使用 C++17 实现的持久化键值存储，将 LSM 存储引擎与基于 gRPC 的可配置奇数节点 Raft 复制结合起来。默认示例使用三个节点；每个节点作为独立进程运行，保存自己的数据副本。
 
-项目直接实现存储与共识的核心逻辑，包括 WAL 恢复、不可变 SSTable、后台刷盘与合并、选主、日志复制及已提交命令的执行。目前本机三节点集群已可运行，包含客户端库和命令行工具，提供提交确认、一致性读屏障、Leader 发现及明确的写入未知结果语义。本机故障矩阵已覆盖分区、消息丢失／延迟／重复／乱序及崩溃恢复；可复现混合负载 benchmark 记录完整调用的吞吐量与 P50/P95/P99 延迟。
+项目直接实现存储与共识的核心逻辑，包括 WAL 恢复、不可变 SSTable、后台刷盘与合并、选主、日志复制及已提交命令的执行。本机集群包含客户端库和命令行工具，提供提交确认、一致性读屏障、Leader 发现及明确的写入未知结果语义。本机故障矩阵已覆盖分区、消息丢失／延迟／重复／乱序及崩溃恢复；可复现混合负载 benchmark 记录完整调用的吞吐量与 P50/P95/P99 延迟。
 
-**工程状态：** 原规划的存储引擎与三节点复制功能及验证均已完成，包含故障恢复和 benchmark 实测。[架构回顾](docs/final-review.md)汇总了实现与验收证据。这是一个系统学习项目，当前[范围与限制](#当前范围与限制)见下文。
+**工程状态：** 原规划的存储与复制功能已实现，包含故障恢复和 benchmark 实测。启动时可配置 1、3、5、7 等正奇数个成员，使用同一目录期间成员集合固定。[架构回顾](docs/final-review.md)与[成员配置扩展](docs/steps/20-odd-membership.md)汇总了实现和验证证据。这是一个系统学习项目，当前[范围与限制](#当前范围与限制)见下文。
 
 [功能](#功能) · [架构](#架构) · [构建与运行](#构建与本地运行) · [测试](#测试) · [性能测量](#性能测量) · [当前范围](#当前范围与限制)
 
@@ -14,7 +14,7 @@
 
 | 存储引擎 | 复制与网络 |
 | --- | --- |
-| Put、Get、Delete，键和值支持二进制字节 | 三个 Raft 成员，可配置节点 ID 和端口 |
+| Put、Get、Delete，键和值支持二进制字节 | 可配置正奇数个成员、节点 ID 和端口 |
 | 带校验的预写日志及重启恢复 | 任期、投票与复制日志持久化 |
 | 有序 MemTable、不可变 SSTable、删除标记 | Leader 选举、心跳与多数派提交 |
 | 自动后台刷盘、WAL 轮换和写入背压 | 日志冲突修正及节点重新加入后的追赶 |
@@ -41,7 +41,7 @@ flowchart LR
     Node2 <-->|Raft 消息| Node3
 ```
 
-图中展示的是组件关系，任一节点都可能当选 Leader。正式业务操作由 Client 自动发现 Leader；`kvadmin` 连接使用者明确指定的地址进行诊断。
+图中展示的是默认三节点组件关系，任一成员都可能当选 Leader。正式业务操作由 Client 自动发现 Leader；`kvadmin` 连接使用者明确指定的地址进行诊断。
 
 ### 复制写入流程
 
@@ -119,7 +119,7 @@ mkdir -p build/demo
 
 `raft_demo` 展示选举、复制和冲突处理；`replica_demo` 加入真实 Store 查询、已提交写入及恢复。需要运行通过网络通信的独立进程时，使用下一节的方式。
 
-### 三节点 gRPC 集群
+### gRPC 集群：三节点示例
 
 首先将固定版本的 gRPC 依赖和配套 Protobuf 工具构建到项目内的 `build/deps/`：
 
@@ -211,6 +211,20 @@ cluster_members='1=127.0.0.1:50051,2=127.0.0.1:50052,3=127.0.0.1:50053'
 
 `kvadmin` 是管理工具，不会自动发现 Leader、转发 Follower 上的提议或重试写入。`local-get` 读取指定节点已经执行的本地状态，可能读到落后数据，包括被隔离的旧 Leader 上的数据，因此不提供线性一致读。成功 RPC 的退出码为 0，RPC 错误为 1，参数错误为 2，本地 key 不存在为 3；`applied` 返回 `false` 时退出码仍为 0。
 
+### 其他奇数规模
+
+节点根据 `--members` 推导 N；Client 根据传入的成员列表推导 N，`kvclient` 将该列表作为第一个位置参数。所有节点与客户端使用同一份成员配置，每个成员需要一个独立进程和数据目录。五节点示例先启动：
+
+```sh
+cluster_members='1=127.0.0.1:51001,2=127.0.0.1:51002,3=127.0.0.1:51003,4=127.0.0.1:51004,5=127.0.0.1:51005'
+mkdir -p build/cluster5
+./build/network/kvnode --id 1 --directory build/cluster5/node1 --mode new --members "$cluster_members"
+```
+
+在另外四个终端使用相同列表和各自的 ID/目录启动成员 2–5，再将同一列表传给 `kvclient`。也支持单节点列表，方便调试。多数派为 `floor(N / 2) + 1`：五节点需要三个确认，单节点自己即可确认，但没有节点故障容错能力。空成员集合或偶数数量会在创建数据前被拒绝。
+
+现有三节点目录保留原格式；重新打开要求成员 ID 集合不变，直接改列表不构成在线扩缩容。完整启动方式与兼容规则见[成员配置说明](docs/steps/20-odd-membership.md)。
+
 ## 测试
 
 默认构建完成后，运行不含网络的测试：
@@ -219,7 +233,7 @@ cluster_members='1=127.0.0.1:50051,2=127.0.0.1:50052,3=127.0.0.1:50053'
 ctest --test-dir build --output-on-failure
 ```
 
-网络构建完成后，运行包含真实三进程测试的完整测试：
+网络构建完成后，运行包含真实节点进程测试的完整测试：
 
 ```sh
 ctest --test-dir build/network --output-on-failure
@@ -228,18 +242,18 @@ ctest --test-dir build/network --output-on-failure
 只运行网络测试：
 
 ```sh
-ctest --test-dir build/network -R '^(grpc_.*|client_process|cluster_fault)$' --output-on-failure
+ctest --test-dir build/network -R '^(grpc_.*|client_process|cluster_fault|odd_process)$' --output-on-failure
 ```
 
 | 构建配置 | CTest 组数 |
 | --- | --- |
-| 默认构建，关闭 gRPC | 19 |
-| 启用 gRPC | 23 |
-| 同时启用 gRPC 与 benchmark | 25 |
+| 默认构建，关闭 gRPC | 20 |
+| 启用 gRPC | 25 |
+| 同时启用 gRPC 与 benchmark | 27 |
 
 覆盖记录损坏与截断、WAL 回放、manifest 发布、删除标记、后台任务交错、索引和缓存、Raft 选举与冲突修正、提交执行及进程崩溃。网络测试覆盖真实 KV 复制、Leader 被终止后重选、节点重启追赶、非法 RPC、并发管理调用及关闭。客户端测试还覆盖提交确认、失去多数派、读屏障、安全重定向、实际提交后的回复丢失及 CLI 未知结果。七类集群故障场景进一步覆盖存活 Leader 隔离、Follower 隔离、单向丢失、完全分区、两种混合消息序列、崩溃／重启组合及路由校验。测试使用独立临时数据；网络测试需要允许绑定回环端口和启动子进程。
 
-启用 benchmark 的 Release 和 AddressSanitizer/UndefinedBehaviorSanitizer 构建均已通过全部 25 组测试，包含原有 23 组。最新验证记录和插桩范围见[benchmark 说明](docs/steps/19-benchmark.md#自动化回归)，消息故障矩阵见[集群故障说明](docs/steps/18-cluster-faults.md#验证结果与范围)。此前[目录整理](docs/steps/16a-project-layout.md)记录了当时完成的线程检查和全新目录构建验证。测试耗时不等于吞吐量或延迟 benchmark。
+新增成员配置测试覆盖 1/3/5/7 节点协议行为、真实 1/5/7 进程、五节点分区与强杀、元数据损坏及旧三节点兼容。默认构建 20 组全部通过，启用 benchmark 的 Release 和 ASan/UBSan 构建各 27 组全部通过，包含原有全部用例。最新验证记录见[成员扩展说明](docs/steps/20-odd-membership.md#验证结果)，此前三节点消息故障矩阵见[集群故障说明](docs/steps/18-cluster-faults.md#验证结果与范围)。此前[目录整理](docs/steps/16a-project-layout.md)记录了当时完成的线程检查。测试耗时不等于吞吐量或延迟 benchmark。
 
 单独运行故障矩阵，并显示场景进度及消息计数：
 
@@ -259,9 +273,15 @@ cmake --build build/release
 python3 scripts/benchmark.py --build-dir build/release
 ```
 
-运行脚本需要 Python 3.9 或更新版本，只使用标准库。每轮自动启动全新的三节点集群，预装 256 个 key、预热 128 条请求，再用持续运行的 C++ Client 测量 1000 条请求。默认负载为 95% Get / 5% Put 和 50% Get / 40% Put / 10% Delete，各自使用并发 1、4，每种组合重复三次，无需手动启动节点。
+运行脚本需要 Python 3.9 或更新版本，只使用标准库。默认每轮自动启动全新的三节点集群，预装 256 个 key、预热 128 条请求，再用持续运行的 C++ Client 测量 1000 条请求。默认负载为 95% Get / 5% Put 和 50% Get / 40% Put / 10% Delete，各自使用并发 1、4，每种组合重复三次，无需手动启动节点。
 
-命令最后打印 `build/benchmark-results/` 下的报告位置。报告保留每轮结果、逐条延迟、结果计数、各操作统计、构建与机器信息，以及节点日志和数据；不会覆盖已有输出目录。启用 benchmark 的测试构建新增 `benchmark_workload` 和 `benchmark_smoke`，共 25 组 CTest，其他构建配置的测试数量不变。
+通过 `--nodes N` 选择其他正奇数规模，默认值为 3。较短的五节点运行示例：
+
+```sh
+python3 scripts/benchmark.py --build-dir build/release --nodes 5 --profile mixed --threads 4 --repetitions 1 --operations 200
+```
+
+命令最后打印 `build/benchmark-results/` 下的报告位置。报告保留每轮结果、逐条延迟、结果计数、各操作统计、构建与机器信息，以及节点日志和数据；不会覆盖已有输出目录。启用 benchmark 的测试构建包含 `benchmark_workload` 和 `benchmark_smoke`，共 27 组 CTest，其中流程验证会分别运行 1、3、5 节点。
 
 运行该构建的完整测试：
 
@@ -271,7 +291,7 @@ ctest --test-dir build/release --output-on-failure
 
 ### 本机实测结果
 
-实测环境为 Apple M3、16 GiB 内存、macOS arm64、Release 构建。下表每个范围来自三次独立运行，每轮正式请求 1000 次，预装 256 个 key，value 为 256 字节。延迟按全部正式调用计算 nearest-rank 分位数；12,000 次正式请求全部返回 Ok。
+下表是可配置成员改造前的三节点基线，实测环境为 Apple M3、16 GiB 内存、macOS arm64、Release 构建。每个范围来自三次独立运行，每轮正式请求 1000 次，预装 256 个 key，value 为 256 字节。延迟按全部正式调用计算 nearest-rank 分位数；12,000 次正式请求全部返回 Ok。数字保留原版本和原配置含义。
 
 | 负载 | 并发客户端 | 成功 ops/s | P50 ms | P95 ms | P99 ms |
 | --- | --- | --- | --- | --- | --- |
@@ -304,7 +324,7 @@ docs/               架构说明和逐步实现讲解，使用中文
 
 ## 当前范围与限制
 
-- 网络运行层目前支持三个静态成员，仅接受 `127.0.0.1` 地址，使用无认证的明文 gRPC。
+- 网络运行层支持正奇数个静态成员，仅接受 `127.0.0.1` 地址，使用无认证的明文 gRPC；不提供运行中成员变更。
 - 客户端已提供一致性读取和提交确认。每次读取追加 NoOp；暂不提供请求去重、不确定写入的自动重放或 exactly-once 保证。
 - 暂无事务、MVCC、快照、Raft 日志截断及分层合并。Store 的 compaction 回收 SSTable，不负责压缩 Raft 日志。逻辑 Raft 日志上限为 64 MiB、1,000,000 条，包含读取产生的屏障。
 - SSTable 的 Bloom 过滤器和块索引在打开文件时重建到内存。Store 的前台操作目前共用一把较大粒度的锁，每条写入单独同步 WAL。
@@ -312,6 +332,7 @@ docs/               架构说明和逐步实现讲解，使用中文
 
 ## 延伸阅读
 
+- [奇数规模成员配置](docs/steps/20-odd-membership.md)：启动配置、多数派计算、旧格式兼容与恢复验证。
 - [最终架构回顾与验收](docs/final-review.md)：串联读写、恢复、锁、提交规则和已完成范围。
 - [Benchmark 测量方法](docs/steps/19-benchmark.md)与[本机结果](docs/benchmarks/step19-local.md)：负载、计时、逐条样本与解释范围。
 - [集群故障矩阵](docs/steps/18-cluster-faults.md)：转发机制、场景、正确性检查和验证范围。

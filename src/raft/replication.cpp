@@ -3,7 +3,6 @@
 #include "storage_codec.h"
 
 #include <algorithm>
-#include <array>
 #include <stdexcept>
 #include <utility>
 
@@ -58,6 +57,7 @@ Proposal Node::AppendProposal(Command command) {
         throw;
     }
     try {
+        AdvanceCommit();
         for (auto& peer : peers_) { SendAppend(peer); }
     } catch (...) { Fail(); throw; }
     return proposal;
@@ -97,10 +97,13 @@ void Node::SendHeartbeats() {
 }
 
 void Node::AdvanceCommit() {
-    // This project's configuration is always three members (majority = two).
-    std::array<LogIndex, 3> matched{status().last_log_index, peers_[0].match_index, peers_[1].match_index};
+    std::vector<LogIndex> matched;
+    matched.reserve(peers_.size() + 1);
+    matched.push_back(status().last_log_index);
+    for (const auto& peer : peers_) { matched.push_back(peer.match_index); }
     std::sort(matched.begin(), matched.end());
-    const auto candidate = matched[1];
+    // At least majority_size() members have replicated through this position.
+    const auto candidate = matched[matched.size() - majority_size()];
     const auto& log = persistent_state().log;
     // Counting replicas alone cannot commit an entry from an older term.
     if (candidate > commit_index_ && log[candidate - 1].term == persistent_state().current_term) {

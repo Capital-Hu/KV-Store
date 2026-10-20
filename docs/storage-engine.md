@@ -145,4 +145,4 @@ SSTable 不需要像 WAL 一样回放到 MemTable，它本身已经是可以查�
 
 没有事务、MVCC、历史快照、持久化 Bloom/块索引、块压缩或分层合并策略；前台访问仍串行取得状态锁。尚未做实际断电实验，或单机大数据集、冷热缓存与长期合并的性能测量。第 19 步已完成[三节点完整 Client 路径的吞吐量与尾延迟 benchmark](steps/19-benchmark.md)，默认工作集落在 MemTable，不能当作单机 SSTable 性能结论。
 
-三节点模式中，Raft 负责复制顺序和提交，ReplicatedStore 将已提交命令交给本地引擎。这里的 Store WAL 仍只负责本地恢复，不能单独提供多数派提交或三节点一致性。
+复制模式中，Raft 负责复制顺序和提交，ReplicatedStore 将已提交命令交给本地引擎。这里的 Store WAL 仍只负责本地恢复，不能单独提供多数派提交或多节点一致性。当前支持正奇数个静态成员，默认示例为三个，见[第 20 步](steps/20-odd-membership.md)。

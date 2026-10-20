@@ -147,8 +147,9 @@ void Storage::ReplaceSuffix(LogIndex first_index, const std::vector<LogEntry>& e
 }
 
 void Storage::Load(StorageRecoveryMode recovery) {
-    detail::ValidateFileHeader(ReadUpTo(fd_, detail::kFileHeaderBytes), config_);
-    off_t valid_offset = detail::kFileHeaderBytes;
+    const auto header_bytes = detail::FileHeaderBytes(config_);
+    detail::ValidateFileHeader(ReadUpTo(fd_, header_bytes), config_);
+    off_t valid_offset = static_cast<off_t>(header_bytes);
     for (;;) {
         const auto header = ReadUpTo(fd_, detail::kFrameHeaderBytes);
         if (header.empty()) { break; }

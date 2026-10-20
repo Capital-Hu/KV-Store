@@ -19,7 +19,7 @@ namespace {
 constexpr std::size_t kPeerQueueLimit = 16;
 
 raft::NodeConfig Validate(const ServerOptions& options) {
-    if (options.id == 0 || options.members.size() != 3 || options.tick_interval.count() <= 0 ||
+    if (options.id == 0 || !raft::ValidMemberCount(options.members.size()) || options.tick_interval.count() <= 0 ||
         options.rpc_timeout.count() <= 0 || options.client_wait_timeout.count() <= 0 ||
         options.client_wait_timeout > std::chrono::seconds{30} ||
         options.tick_interval >= options.replica.election.heartbeat_interval) {

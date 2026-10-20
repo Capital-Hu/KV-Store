@@ -44,7 +44,7 @@ void TestFreshThreeNodeState() {
 
 void TestInvalidMembership() {
     const std::vector<raft::NodeConfig> invalid{
-        {0, {1, 2}}, {1, {}}, {1, {2}}, {1, {2, 3, 4}},
+        {0, {1, 2}}, {1, {2}}, {1, {2, 3, 4}},
         {1, {0, 2}}, {1, {2, 0}}, {1, {1, 2}}, {1, {2, 1}}, {1, {2, 2}}};
     for (const auto& config : invalid) {
         CheckThrows<std::invalid_argument>([&] { raft::Node node(config); }, "Reject invalid cluster membership");

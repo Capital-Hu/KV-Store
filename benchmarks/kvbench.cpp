@@ -186,7 +186,8 @@ int main(int argc, char** argv) {
         std::cout << std::setprecision(12) << "{\"schema_version\":1,\"clock\":\"steady_clock\",\"load_model\":\"closed_loop\","
                   << "\"build_type\":" << bench::JsonString(KVSTORE_BENCH_BUILD_TYPE)
                   << ",\"compiler\":" << bench::JsonString(__VERSION__) << ",\"members\":" << bench::JsonString(members)
-                  << ",\"parameters\":{\"operations\":" << options.operations << ",\"warmup\":" << options.warmup
+                  << ",\"parameters\":{\"nodes\":" << client_options.members.size()
+                  << ",\"operations\":" << options.operations << ",\"warmup\":" << options.warmup
                   << ",\"keys\":" << options.keys << ",\"key_bytes\":16,\"value_bytes\":" << options.value_bytes
                   << ",\"threads\":" << options.threads << ",\"read_percent\":" << options.read_percent
                   << ",\"delete_percent\":" << options.delete_percent << ",\"seed\":" << options.seed

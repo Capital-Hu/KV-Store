@@ -219,7 +219,7 @@ void TestInvalidClientConfiguration() {
     rpc::ClientOptions options;
     bool rejected = false;
     try { rpc::Client client(options); } catch (const std::invalid_argument&) { rejected = true; }
-    Check(rejected, "Client requires three members");
+    Check(rejected, "Client requires a positive odd member count");
     const auto addresses = Addresses(); options.members = {{1,addresses[0]}, {2,addresses[1]}, {3,addresses[2]}};
     options.timeout = 0ms; rejected = false;
     try { rpc::Client client(options); } catch (const std::invalid_argument&) { rejected = true; }

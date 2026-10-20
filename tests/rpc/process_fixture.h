@@ -64,6 +64,9 @@ std::string Read(const std::string& path) {
 
 class Child {
 public:
+    Child() = default;
+    Child(const Child&) = delete;
+    Child& operator=(const Child&) = delete;
     ~Child() {
         if (pid_ == 0) { return; }
         ::kill(pid_, SIGTERM);
@@ -107,10 +110,10 @@ private:
     std::string log_;
 };
 
-std::array<std::string, 3> Addresses() {
-    std::array<int, 3> sockets{-1, -1, -1};
-    struct Close { std::array<int, 3>& descriptors; ~Close() { for (const auto fd : descriptors) { if (fd != -1) { ::close(fd); } } } } cleanup{sockets};
-    std::array<std::string, 3> result;
+std::vector<std::string> Addresses(std::size_t count = 3) {
+    std::vector<int> sockets(count, -1);
+    struct Close { std::vector<int>& descriptors; ~Close() { for (const auto fd : descriptors) { if (fd != -1) { ::close(fd); } } } } cleanup{sockets};
+    std::vector<std::string> result(count);
     for (std::size_t i = 0; i < sockets.size(); ++i) {
         sockets[i] = ::socket(AF_INET, SOCK_STREAM, 0);
         if (sockets[i] < 0) { throw std::system_error(errno, std::generic_category(), "Create loopback socket"); }
@@ -127,15 +130,18 @@ std::array<std::string, 3> Addresses() {
 class Cluster {
 public:
     explicit Cluster(bool start_all = true,
-                     std::function<std::string(const std::array<std::string, 3>&)> route_factory = {}) : addresses(Addresses()) {
-        for (std::size_t i = 0; i < 3; ++i) {
+                     std::function<std::string(const std::vector<std::string>&)> route_factory = {},
+                     std::size_t count = 3) : addresses(Addresses(count)), stubs(count), children(count) {
+        Check(raft::ValidMemberCount(count), "Cluster needs a positive odd member count");
+        for (std::size_t i = 0; i < count; ++i) {
             if (i != 0) { members += ','; }
             members += std::to_string(i + 1) + '=' + addresses[i];
             stubs[i] = wire::NodeAdmin::NewStub(LocalChannel(addresses[i]));
         }
         if (route_factory) { raft_routes = route_factory(addresses); }
-        for (int i = 0; i < (start_all ? 3 : 1); ++i) { Start(i, "new"); }
-        for (int i = 0; i < (start_all ? 3 : 1); ++i) { WaitUp(i); }
+        const auto started = start_all ? static_cast<int>(count) : 1;
+        for (int i = 0; i < started; ++i) { Start(i, "new"); }
+        for (int i = 0; i < started; ++i) { WaitUp(i); }
     }
     void Start(int node, const std::string& mode) {
         std::vector<std::string> arguments{node_binary, "--id", std::to_string(node + 1), "--directory", directory.Path("node" + std::to_string(node + 1)),
@@ -155,7 +161,7 @@ public:
         int result = -1;
         Until([&] {
             result = -1;
-            for (int i = 0; i < 3; ++i) {
+            for (int i = 0; i < static_cast<int>(addresses.size()); ++i) {
                 if (i == excluded) { continue; } wire::NodeStatus status;
                 if (Inspect(i, status).ok() && status.role() == wire::LEADER) { if (result != -1) { return false; } result = i; }
             }
@@ -181,7 +187,7 @@ public:
     }
     void WaitApplied(const wire::Proposal& proposal, int excluded = -1) {
         Until([&] {
-            for (int i = 0; i < 3; ++i) {
+            for (int i = 0; i < static_cast<int>(addresses.size()); ++i) {
                 if (i == excluded) { continue; }
                 grpc::ClientContext context; context.set_deadline(std::chrono::system_clock::now() + 300ms);
                 wire::AppliedResponse response;
@@ -191,11 +197,11 @@ public:
         }, "Proposal did not apply on expected nodes");
     }
     Directory directory;
-    std::array<std::string, 3> addresses;
+    std::vector<std::string> addresses;
     std::string members;
     std::string raft_routes;
-    std::array<std::unique_ptr<wire::NodeAdmin::Stub>, 3> stubs;
-    std::array<Child, 3> children;
+    std::vector<std::unique_ptr<wire::NodeAdmin::Stub>> stubs;
+    std::vector<Child> children;
 };
 
 }  // namespace

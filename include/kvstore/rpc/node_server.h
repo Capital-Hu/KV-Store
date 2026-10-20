@@ -24,7 +24,7 @@ struct ServerOptions {
     std::chrono::milliseconds client_wait_timeout{1000};
 };
 
-// Local, trusted three-process transport. Internally serializes all Replica calls.
+// Local, trusted static odd-sized transport. Internally serializes all Replica calls.
 // Lifecycle operations belong to the owning thread; Stop is idempotent.
 class NodeServer {
 public:

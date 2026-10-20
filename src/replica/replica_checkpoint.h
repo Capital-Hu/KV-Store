@@ -12,7 +12,7 @@ struct ReplicaCheckpoint {
     std::uint32_t fingerprint = 0;
 };
 
-constexpr std::size_t kReplicaCheckpointBytes = 52;
+std::size_t ReplicaCheckpointBytes(const raft::NodeConfig& config);
 std::string EncodeReplicaCheckpoint(const raft::NodeConfig& config, const ReplicaCheckpoint& checkpoint);
 ReplicaCheckpoint DecodeReplicaCheckpoint(std::string_view bytes, const raft::NodeConfig& config);
 std::uint32_t ExtendReplicaFingerprint(std::uint32_t previous, const raft::LogEntry& entry);

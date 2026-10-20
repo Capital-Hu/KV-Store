@@ -2,13 +2,14 @@
 #include "common/coding.h"
 
 #include <algorithm>
+#include <limits>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
 namespace kvstore::raft::detail {
 namespace {
 namespace coding = kvstore::detail;
-constexpr std::string_view kFileMagic = "KVR1";
 constexpr std::string_view kFrameMagic = "RFR1";
 constexpr std::size_t kEntryHeaderBytes = 25;
 
@@ -36,13 +37,15 @@ private:
 }  // namespace
 
 void ValidateConfig(const NodeConfig& config) {
-    if (config.id == 0 || config.peers.size() != 2) {
-        throw std::invalid_argument("Raft requires a nonzero node ID and exactly two peers");
+    if (config.id == 0 || !ValidMemberCount(config.peers.size() + 1) ||
+        config.peers.size() > std::numeric_limits<std::uint32_t>::max() ||
+        config.peers.size() > (std::numeric_limits<std::size_t>::max() - 40) / 8) {
+        throw std::invalid_argument("Raft requires a nonzero node ID and a positive odd member count");
     }
-    if (config.peers[0] == config.peers[1]) { throw std::invalid_argument("Raft peer IDs must be distinct"); }
+    std::set<NodeId> seen;
     for (const auto peer : config.peers) {
-        if (peer == 0 || peer == config.id) {
-            throw std::invalid_argument("Raft peers must be nonzero and exclude this node");
+        if (peer == 0 || peer == config.id || !seen.insert(peer).second) {
+            throw std::invalid_argument("Raft peers must be distinct, nonzero and exclude this node");
         }
     }
 }
@@ -108,20 +111,29 @@ std::size_t ValidateSuffix(const PersistentState& state, std::size_t log_bytes,
 
 std::string EncodeFileHeader(const NodeConfig& config) {
     ValidateConfig(config);
-    std::string bytes(kFileMagic);
+    const bool legacy = config.peers.size() == 2;
+    std::string bytes(legacy ? "KVR1" : "KVR2");
     coding::AppendU64(bytes, config.id);
-    coding::AppendU64(bytes, std::min(config.peers[0], config.peers[1]));
-    coding::AppendU64(bytes, std::max(config.peers[0], config.peers[1]));
+    if (!legacy) { coding::AppendU32(bytes, static_cast<std::uint32_t>(config.peers.size())); }
+    auto peers = config.peers;
+    std::sort(peers.begin(), peers.end());
+    for (const auto peer : peers) { coding::AppendU64(bytes, peer); }
     coding::AppendU32(bytes, coding::Crc32(bytes));
     return bytes;
 }
 
+std::size_t FileHeaderBytes(const NodeConfig& config) {
+    ValidateConfig(config);
+    return config.peers.size() == 2 ? 32 : 20 + 8 * config.peers.size();
+}
+
 void ValidateFileHeader(std::string_view bytes, const NodeConfig& config) {
-    if (bytes.size() != kFileHeaderBytes || bytes.substr(0, 4) != kFileMagic ||
-        coding::ReadU32(bytes, 28) != coding::Crc32(bytes.substr(0, 28))) {
+    const auto expected = EncodeFileHeader(config);
+    if (bytes.size() != expected.size() || bytes.substr(0, 4) != expected.substr(0, 4) ||
+        coding::ReadU32(bytes, bytes.size() - 4) != coding::Crc32(bytes.substr(0, bytes.size() - 4))) {
         throw std::runtime_error("Invalid Raft file header or checksum");
     }
-    if (bytes != EncodeFileHeader(config)) { throw std::runtime_error("Raft file belongs to a different node or cluster"); }
+    if (bytes != expected) { throw std::runtime_error("Raft file belongs to a different node or cluster"); }
 }
 
 std::string EncodeChange(const Change& change) {

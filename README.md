@@ -2,11 +2,11 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A persistent key-value store written in C++17, combining an LSM storage engine with three-node Raft replication over gRPC. Each node runs as an independent process and stores its own copy of the data.
+A persistent key-value store written in C++17, combining an LSM storage engine with configurable odd-sized Raft replication over gRPC. Examples default to three nodes; each node runs as an independent process and stores its own copy of the data.
 
-The project implements the storage and consensus layers directly, including WAL recovery, immutable SSTables, background flush and compaction, leader election, log replication, and committed-command application. The local three-node cluster includes a client library and CLI with commit-confirmed writes, log-barrier reads, leader discovery, and explicit handling of uncertain write outcomes. A local fault matrix exercises partitions, message loss/delay/duplication/reordering, and crash recovery. A reproducible mixed-workload benchmark records end-to-end throughput and P50/P95/P99 latency.
+The project implements the storage and consensus layers directly, including WAL recovery, immutable SSTables, background flush and compaction, leader election, log replication, and committed-command application. The local cluster includes a client library and CLI with commit-confirmed writes, log-barrier reads, leader discovery, and explicit handling of uncertain write outcomes. A local fault matrix exercises partitions, message loss/delay/duplication/reordering, and crash recovery. A reproducible mixed-workload benchmark records end-to-end throughput and P50/P95/P99 latency.
 
-**Project status:** The planned storage-engine and three-node replication scope is implemented and validated, including fault recovery and benchmark runs. The [architecture review](docs/final-review.md) collects the implementation and validation evidence. This is a systems learning project with the [scope and limitations](#scope-and-limitations) described below.
+**Project status:** The planned storage and replication scope is implemented, including fault recovery and benchmark runs. Membership can be configured at startup as 1, 3, 5, 7, or another positive odd count and stays fixed for that data directory. The [architecture review](docs/final-review.md) and [membership extension](docs/steps/20-odd-membership.md) collect implementation and validation evidence. This is a systems learning project with the [scope and limitations](#scope-and-limitations) described below.
 
 [Features](#features) · [Architecture](#architecture) · [Build and run](#build-and-run-locally) · [Testing](#testing) · [Benchmark](#benchmark) · [Scope](#scope-and-limitations)
 
@@ -14,7 +14,7 @@ The project implements the storage and consensus layers directly, including WAL 
 
 | Storage engine | Replication and networking |
 | --- | --- |
-| Put, Get, and Delete with binary-safe keys and values | Three Raft members with configurable node IDs and ports |
+| Put, Get, and Delete with binary-safe keys and values | Configurable positive odd member count, node IDs, and ports |
 | Checksummed write-ahead log and restart recovery | Persistent terms, votes, and replication logs |
 | Ordered MemTables, immutable SSTables, and deletion tombstones | Leader election, heartbeats, and majority-based commits |
 | Automatic background flush with WAL rotation and write backpressure | Log conflict repair and catch-up after a node rejoins |
@@ -41,7 +41,7 @@ flowchart LR
     Node2 <-->|Raft messages| Node3
 ```
 
-The diagram shows the component layout; the elected leader can be any node. The Client discovers the leader for application operations; `kvadmin` connects to an explicitly chosen address for diagnostics.
+The diagram illustrates the default three-node layout; the elected leader can be any member. The Client discovers the leader for application operations; `kvadmin` connects to an explicitly chosen address for diagnostics.
 
 ### Replicated write path
 
@@ -119,7 +119,7 @@ Two self-contained demos use temporary data and simulate message delivery within
 
 `raft_demo` demonstrates elections, replication, and conflicts. `replica_demo` adds actual Store reads, committed writes, and recovery. Use the next section for separate processes communicating over the network.
 
-### Three-node gRPC cluster
+### gRPC cluster: three-node example
 
 Build the pinned gRPC dependency and its matching Protobuf tools inside `build/deps/`:
 
@@ -211,6 +211,20 @@ Submit a deletion to the current leader with `propose-delete name`, and check it
 
 `kvadmin` is an administration tool: it does not discover the leader, forward follower proposals, or retry writes. `local-get` reads that node's applied state and may return stale data, including from an isolated former leader. These are not linearizable client reads. Exit codes are 0 for a successful RPC, 1 for an RPC error, 2 for invalid arguments, and 3 for a missing local key; `applied` returning `false` still exits with code 0.
 
+### Other odd-sized clusters
+
+The node infers N from `--members`; the Client uses its supplied member list (`kvclient` takes it as the first positional argument). Every node and client must use the same membership, and there must be one process and separate data directory per member. A five-node example starts with:
+
+```sh
+cluster_members='1=127.0.0.1:51001,2=127.0.0.1:51002,3=127.0.0.1:51003,4=127.0.0.1:51004,5=127.0.0.1:51005'
+mkdir -p build/cluster5
+./build/network/kvnode --id 1 --directory build/cluster5/node1 --mode new --members "$cluster_members"
+```
+
+Start members 2–5 in additional terminals using the same list and their own IDs/directories, then use that list with `kvclient`. A single-node list is also supported for debugging. The quorum is `floor(N / 2) + 1`: five members need three confirmations, while one member confirms alone and has no node-failure tolerance. Empty or even member counts are rejected before data creation.
+
+Existing three-node data retains its original format. Reopening a directory requires the same member ID set; changing the list is not an online resize operation. Detailed startup and compatibility notes are in the [membership guide](docs/steps/20-odd-membership.md).
+
 ## Testing
 
 Run the non-network suite after the default build:
@@ -219,7 +233,7 @@ Run the non-network suite after the default build:
 ctest --test-dir build --output-on-failure
 ```
 
-Run the full suite, including real three-process tests, after the network build:
+Run the full suite, including real node-process tests, after the network build:
 
 ```sh
 ctest --test-dir build/network --output-on-failure
@@ -228,18 +242,18 @@ ctest --test-dir build/network --output-on-failure
 To run only the network tests:
 
 ```sh
-ctest --test-dir build/network -R '^(grpc_.*|client_process|cluster_fault)$' --output-on-failure
+ctest --test-dir build/network -R '^(grpc_.*|client_process|cluster_fault|odd_process)$' --output-on-failure
 ```
 
 | Build configuration | CTest groups |
 | --- | --- |
-| Default, gRPC disabled | 19 |
-| gRPC enabled | 23 |
-| gRPC and benchmarks enabled | 25 |
+| Default, gRPC disabled | 20 |
+| gRPC enabled | 25 |
+| gRPC and benchmarks enabled | 27 |
 
 Coverage includes record corruption and truncation, WAL replay, manifest publication, tombstones, background-task interleavings, indexes and caching, Raft elections and conflict resolution, committed application, and process crashes. Network tests cover real KV replication, leader termination and re-election, node restart and catch-up, invalid RPCs, concurrent administration calls, and shutdown. Client tests additionally cover commit acknowledgements, quorum loss, read barriers, safe redirection, lost replies after real commits, and uncertain CLI outcomes. The seven cluster fault scenarios additionally cover live-leader isolation, follower isolation, one-way loss, complete partition, two mixed message schedules, combined crash/restart, and route validation. Tests create their own temporary data; network tests require permission to bind loopback ports and spawn child processes.
 
-The benchmark-enabled Release and AddressSanitizer/UndefinedBehaviorSanitizer builds have passed the full 25-group suite, including the original 23 groups. Latest validation results and instrumentation limits are recorded in the [benchmark notes](docs/steps/19-benchmark.md#自动化回归); the [fault notes](docs/steps/18-cluster-faults.md#验证结果与范围) describe the message-fault matrix. The earlier [directory reorganization](docs/steps/16a-project-layout.md) also records the thread checks and fresh-build verification performed at that stage. Test duration is not a throughput or latency benchmark.
+The added membership tests cover 1/3/5/7-node protocol behavior, real 1/5/7-node processes, five-node partitions and crashes, metadata corruption, and legacy three-node compatibility. The default suite passed all 20 groups; benchmark-enabled Release and ASan/UBSan builds each passed all 27 groups, including every previous test. Latest validation results are recorded in the [membership notes](docs/steps/20-odd-membership.md#验证结果); the [fault notes](docs/steps/18-cluster-faults.md#验证结果与范围) describe the earlier three-node matrix. The earlier [directory reorganization](docs/steps/16a-project-layout.md) records thread checks performed at that stage. Test duration is not a throughput or latency benchmark.
 
 To run the fault matrix alone, with scenario progress and message counters:
 
@@ -259,9 +273,15 @@ cmake --build build/release
 python3 scripts/benchmark.py --build-dir build/release
 ```
 
-The Python 3.9+ runner uses only the standard library. It starts a fresh three-node cluster for each run, preloads 256 keys, warms up with 128 requests, then measures 1000 requests through persistent C++ clients. Defaults cover 95% Get / 5% Put and 50% Get / 40% Put / 10% Delete at concurrency 1 and 4, with three repetitions each. No manual node startup is needed.
+The Python 3.9+ runner uses only the standard library. By default, it starts a fresh three-node cluster for each run, preloads 256 keys, warms up with 128 requests, then measures 1000 requests through persistent C++ clients. Defaults cover 95% Get / 5% Put and 50% Get / 40% Put / 10% Delete at concurrency 1 and 4, with three repetitions each. No manual node startup is needed.
 
-The command prints the report location under `build/benchmark-results/`. Reports retain every run, raw request latencies, outcome counts, per-operation statistics, build and machine information, and node logs/data. Existing output directories are protected from overwrite. The benchmark-enabled test build adds `benchmark_workload` and `benchmark_smoke`, for 25 CTest groups; the other build configurations keep their existing counts.
+Use `--nodes N` to choose another positive odd count; the default is 3. For a short five-node run:
+
+```sh
+python3 scripts/benchmark.py --build-dir build/release --nodes 5 --profile mixed --threads 4 --repetitions 1 --operations 200
+```
+
+The command prints the report location under `build/benchmark-results/`. Reports retain every run, raw request latencies, outcome counts, per-operation statistics, build and machine information, and node logs/data. Existing output directories are protected from overwrite. The benchmark-enabled test build adds `benchmark_workload` and `benchmark_smoke`, for 27 CTest groups; its process checks exercise 1, 3, and 5 nodes.
 
 Run that build's full test suite with:
 
@@ -271,7 +291,7 @@ ctest --test-dir build/release --output-on-failure
 
 ### Recorded local results
 
-The recorded runs used an Apple M3 with 16 GiB RAM, macOS arm64, and a Release build. Each range below spans three independent runs, with 1000 measured requests per run, 256 preloaded keys, and 256-byte values. Latencies are nearest-rank percentiles of all measured calls. All 12,000 measured requests returned Ok.
+This three-node baseline was recorded before the configurable-membership extension, on an Apple M3 with 16 GiB RAM, macOS arm64, and a Release build. Each range below spans three independent runs, with 1000 measured requests per run, 256 preloaded keys, and 256-byte values. Latencies are nearest-rank percentiles of all measured calls. All 12,000 measured requests returned Ok. These numbers retain their original version and configuration.
 
 | Workload | Clients | Ok ops/s | P50 ms | P95 ms | P99 ms |
 | --- | --- | --- | --- | --- | --- |
@@ -304,7 +324,7 @@ The root `CMakeLists.txt` defines the core libraries, applications, and demos. E
 
 ## Scope and limitations
 
-- The network runtime currently supports exactly three static members on `127.0.0.1`, using plaintext gRPC without authentication.
+- The network runtime supports a positive odd number of static members on `127.0.0.1`, using plaintext gRPC without authentication. Membership changes while a cluster is running are not implemented.
 - The client implements consistent reads and commit-confirmed writes. Reads append NoOps; there is no request deduplication, automatic replay of uncertain writes, or exactly-once guarantee.
 - Transactions, MVCC, snapshots, Raft log truncation, and leveled compaction are not implemented. Store compaction reclaims SSTables; it does not compact the Raft log. The live Raft log is limited to 64 MiB and 1,000,000 entries, including read barriers.
 - SSTable Bloom filters and block indexes are rebuilt in memory when tables open. Foreground Store operations currently share a coarse mutex, and writes synchronize the WAL individually.
@@ -312,6 +332,7 @@ The root `CMakeLists.txt` defines the core libraries, applications, and demos. E
 
 ## Further reading
 
+- [Odd-sized membership](docs/steps/20-odd-membership.md): startup configuration, quorum calculation, compatibility, and recovery checks.
 - [Final architecture review and acceptance evidence](docs/final-review.md): writes, reads, recovery, locking, and the completed project scope (Chinese).
 - [Benchmark methodology](docs/steps/19-benchmark.md) and [local results](docs/benchmarks/step19-local.md): workload, timing, raw samples, and interpretation.
 - [Cluster fault matrix](docs/steps/18-cluster-faults.md): forwarding, scenarios, correctness checks, and validation limits.

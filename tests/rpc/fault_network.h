@@ -23,9 +23,10 @@ public:
         std::size_t dropped = 0, overflow = 0, forwarded = 0, duplicated = 0, reordered = 0, delayed = 0;
     };
 
-    explicit FaultNetwork(const std::array<std::string, 3>& targets) {
+    explicit FaultNetwork(const std::vector<std::string>& targets)
+        : links_(targets.size(), std::vector<Link>(targets.size())), ends_(targets.size()) {
         do {
-            addresses_ = Addresses();
+            addresses_ = Addresses(targets.size());
         } while (std::any_of(addresses_.begin(), addresses_.end(), [&](const auto& address) {
             return std::find(targets.begin(), targets.end(), address) != targets.end();
         }));
@@ -66,8 +67,8 @@ public:
 
     void Configure(const std::function<Rule(int, int)>& rules) {
         std::unique_lock<std::mutex> lock(mutex_);
-        for (int from = 0; from < 3; ++from) {
-            for (int to = 0; to < 3; ++to) {
+        for (int from = 0; from < static_cast<int>(ends_.size()); ++from) {
+            for (int to = 0; to < static_cast<int>(ends_.size()); ++to) {
                 if (from == to) { continue; }
                 auto& link = links_[from][to]; link.rule = rules(from, to); ++link.generation; link.admitted = 0;
             }
@@ -109,7 +110,7 @@ private:
     struct Service final : wire::RaftTransport::Service {
         Service(FaultNetwork& owner, std::size_t destination) : owner(owner), destination(destination) {}
         grpc::Status Deliver(grpc::ServerContext*, const wire::Envelope* input, wire::Empty*) override {
-            if (input->from() < 1 || input->from() > 3 || input->to() != destination + 1 || input->from() == input->to()) {
+            if (input->from() < 1 || input->from() > owner.ends_.size() || input->to() != destination + 1 || input->from() == input->to()) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "Wrong forwarding route"};
             }
             try { return owner.Admit(destination, *input); }
@@ -198,11 +199,11 @@ private:
         }
     }
 
-    std::array<std::string, 3> addresses_;
+    std::vector<std::string> addresses_;
     std::mutex mutex_;
     std::condition_variable ready_;
-    std::array<std::array<Link, 3>, 3> links_;
-    std::array<std::unique_ptr<Endpoint>, 3> ends_;
+    std::vector<std::vector<Link>> links_;
+    std::vector<std::unique_ptr<Endpoint>> ends_;
     Stats stats_;
     bool stopping_ = false;
     std::exception_ptr failure_;
@@ -210,9 +211,9 @@ private:
 
 class FaultCluster {
 public:
-    FaultCluster() : cluster(true, [this](const auto& addresses) {
+    explicit FaultCluster(std::size_t count = 3) : cluster(true, [this](const auto& addresses) {
         network = std::make_unique<FaultNetwork>(addresses); return network->Routes();
-    }) {}
+    }, count) {}
     std::unique_ptr<FaultNetwork> network;
     Cluster cluster;
 };

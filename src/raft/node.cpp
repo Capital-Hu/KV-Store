@@ -152,6 +152,7 @@ void Node::StartElection() {
     leader_id_.reset();
     ClearElection();
     ResetElectionTimer();
+    if (majority_size() == 1) { BecomeLeader(); return; }
     const auto current = status();
     for (auto& peer : peers_) {
         peer.vote_rpc_id = NextRpcId();
@@ -169,6 +170,7 @@ void Node::BecomeLeader() {
     for (auto& peer : peers_) { peer.next_index = next; }
     // A current-term entry lets the new leader establish the committed prefix.
     storage_->Append({{next, status().term, {CommandType::NoOp, {}, {}}}});
+    AdvanceCommit();
     SendHeartbeats();
 }
 

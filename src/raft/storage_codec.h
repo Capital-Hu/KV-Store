@@ -6,7 +6,6 @@
 
 namespace kvstore::raft::detail {
 
-constexpr std::size_t kFileHeaderBytes = 32;
 constexpr std::size_t kFrameHeaderBytes = 12;
 constexpr std::size_t kFrameTrailerBytes = 4;
 
@@ -29,6 +28,7 @@ std::size_t ValidateSuffix(const PersistentState& state, std::size_t log_bytes,
 bool SameEntry(const LogEntry& left, const LogEntry& right);
 
 std::string EncodeFileHeader(const NodeConfig& config);
+std::size_t FileHeaderBytes(const NodeConfig& config);
 void ValidateFileHeader(std::string_view bytes, const NodeConfig& config);
 std::string EncodeChange(const Change& change);
 Change DecodeChange(std::string_view payload);

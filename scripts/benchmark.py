@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run isolated, sequential three-process benchmarks using only the standard library."""
+"""Run isolated, sequential odd-sized Raft benchmarks using only the standard library."""
 
 import argparse
 import csv
@@ -74,10 +74,10 @@ def environment(build, output, cache):
     }
 
 
-def selected_addresses():
+def selected_addresses(count):
     reservations = []
     try:
-        for _ in range(3):
+        for _ in range(count):
             reservation = socket.socket()
             reservations.append(reservation)
             reservation.bind(("127.0.0.1", 0))
@@ -153,12 +153,12 @@ def verify_samples(result, sample_path):
 def run_case(args, build, output, profile, threads, repeat):
     case = output / f"{profile}-c{threads}-r{repeat}"
     case.mkdir()
-    addresses = selected_addresses()
+    addresses = selected_addresses(args.nodes)
     members = ",".join(f"{index + 1}={address}" for index, address in enumerate(addresses))
     children, logs = [], []
     statuses_before = statuses_after = None
     try:
-        for index in range(3):
+        for index in range(args.nodes):
             log = (case / f"node{index + 1}.log").open("x")
             logs.append(log)
             children.append(subprocess.Popen([str(build / "kvnode"), "--id", str(index + 1), "--directory",
@@ -195,7 +195,7 @@ def run_case(args, build, output, profile, threads, repeat):
         raise RuntimeError("Benchmark node did not shut down cleanly; inspect node logs")
     record["files_after_shutdown"] = [
         {"node": index + 1, "sstable_files": len(list((case / f"node{index + 1}").glob("data.sst.*"))),
-         "raft_bytes": (case / f"node{index + 1}" / "raft").stat().st_size} for index in range(3)]
+         "raft_bytes": (case / f"node{index + 1}" / "raft").stat().st_size} for index in range(args.nodes)]
     (case / "case.json").write_text(json.dumps(record, indent=2) + "\n")
     return record
 
@@ -218,7 +218,7 @@ def write_reports(output, metadata, records):
             row.update({f"p{percent}_ms": total["latency_ms_all"][f"p{percent}"] for percent in (50, 95, 99)})
             row.update({f"{kind}_p99_ms": measured["by_operation"][kind]["latency_ms_all"]["p99"] for kind in ("get", "put", "delete")})
             writer.writerow(row)
-    lines = ["# 本机三节点混合负载实测", "", "每行是独立的新集群；延迟为全部调用的 nearest-rank 分位数，吞吐量仅计 Ok。", "",
+    lines = [f"# 本机 {metadata['parameters']['nodes']} 节点混合负载实测", "", "每行是独立的新集群；延迟为全部调用的 nearest-rank 分位数，吞吐量仅计 Ok。", "",
              "| 负载 | 并发 | 轮次 | 退出码 | 预热非 Ok | Ok/请求 | Unknown/Unavailable/Rejected | Ok ops/s | P50 ms | P95 ms | P99 ms |",
              "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for record in records:
@@ -244,7 +244,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/release")
     parser.add_argument("--output", type=Path)
-    for name, default in (("operations", 1000), ("warmup", 128), ("keys", 256), ("value-bytes", 256),
+    for name, default in (("nodes", 3), ("operations", 1000), ("warmup", 128), ("keys", 256), ("value-bytes", 256),
                           ("seed", 4242), ("timeout-ms", 5000), ("repetitions", 3), ("run-timeout", 300)):
         parser.add_argument("--" + name, type=int, default=default)
     parser.add_argument("--threads", default="1,4", help="comma-separated client concurrency levels")
@@ -257,12 +257,13 @@ def main():
     if not args.allow_non_release and (cache.get("CMAKE_BUILD_TYPE") != "Release" or "sanitize=" in flags or re.search(r"(?:^|\s)-O0(?:\s|$)", flags)):
         parser.error("Use a Release build without sanitizers; --allow-non-release is only for validation")
     threads = [int(item) for item in args.threads.split(",")]
-    if (not 1 <= args.operations <= 200000 or not 0 <= args.warmup <= 200000 or not 1 <= args.keys <= 100000
+    if (args.nodes < 1 or args.nodes % 2 == 0 or args.nodes > 65535
+            or not 1 <= args.operations <= 200000 or not 0 <= args.warmup <= 200000 or not 1 <= args.keys <= 100000
             or not 0 <= args.value_bytes <= 65536 or not 1 <= args.repetitions <= 100 or not 0 <= args.seed < 2**64
             or not 1 <= args.timeout_ms <= 30000 or args.run_timeout <= 0 or len(set(threads)) != len(threads)
             or any(not 1 <= item <= min(32, args.operations) for item in threads)
             or (args.operations + args.warmup + args.keys) * (25 + 16 + args.value_bytes) > 48 * 1024 * 1024):
-        parser.error("Invalid workload sizes, concurrency or fresh-cluster log budget")
+        parser.error("Require a positive odd node count and valid workload sizes, concurrency and log budget")
     for name in ("kvbench", "kvnode", "kvadmin"):
         if not os.access(build / name, os.X_OK):
             parser.error(f"Build {name} first")

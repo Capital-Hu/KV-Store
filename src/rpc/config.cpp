@@ -48,7 +48,7 @@ std::vector<Member> ParseMembers(const std::string& text) {
         if (end == std::string::npos) { break; }
         start = end + 1;
     } while (start <= text.size());
-    if (result.size() != 3) { throw std::invalid_argument("Exactly three members are required"); }
+    if (!raft::ValidMemberCount(result.size())) { throw std::invalid_argument("A positive odd member count is required"); }
     return result;
 }
 

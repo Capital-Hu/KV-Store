@@ -113,7 +113,7 @@ void TestStatusFieldsAndUnknownLeader() {
 void TestMemberParsingAndLoopbackRestriction() {
     const auto members = rpc::ParseMembers("10=127.0.0.1:5101,20=127.0.0.1:5102,30=127.0.0.1:5103");
     Check(members.size() == 3 && members[1].id == 20, "Member IDs are configurable");
-    for (const auto& invalid : {"", "1=127.0.0.1:1", "1=127.0.0.1:1,1=127.0.0.1:2,3=127.0.0.1:3",
+    for (const auto& invalid : {"", "1=127.0.0.1:1,2=127.0.0.1:2", "1=127.0.0.1:1,1=127.0.0.1:2,3=127.0.0.1:3",
          "1=127.0.0.1:1,2=127.0.0.1:1,3=127.0.0.1:3", "0=127.0.0.1:1,2=127.0.0.1:2,3=127.0.0.1:3",
          "1=127.0.0.1:1,2=127.0.0.1:2,3=127.0.0.1:3,"}) {
         Reject([&] { rpc::ParseMembers(invalid); }, "Invalid member set rejected");

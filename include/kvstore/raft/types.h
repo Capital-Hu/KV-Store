@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -12,7 +13,9 @@ using NodeId = std::uint64_t;
 using Term = std::uint64_t;
 using LogIndex = std::uint64_t;
 
-// A fixed three-member cluster. Peers exclude this node; IDs must be nonzero.
+constexpr bool ValidMemberCount(std::size_t count) { return count > 0 && count % 2 == 1; }
+
+// Static odd-sized membership. Peers exclude this node; IDs must be nonzero.
 struct NodeConfig {
     NodeId id = 0;
     std::vector<NodeId> peers;

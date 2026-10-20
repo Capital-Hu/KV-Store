@@ -46,7 +46,7 @@ ReplicatedStore::ReplicatedStore(const std::string& directory, raft::NodeConfig 
     const auto checkpoint_path = directory_ + "/COMMIT";
     if (!creating) {
         checkpoint = detail::DecodeReplicaCheckpoint(
-            detail::ReadFile(checkpoint_path, detail::kReplicaCheckpointBytes), config_);
+            detail::ReadFile(checkpoint_path, detail::ReplicaCheckpointBytes(config_)), config_);
         if (!detail::PathExists(directory_ + "/data.manifest") || !detail::PathExists(directory_ + "/data.lock")) {
             throw std::runtime_error("Replica Store metadata is missing; refusing to bootstrap empty data");
         }

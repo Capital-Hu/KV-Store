@@ -22,7 +22,7 @@ struct Client::Impl {
         std::unique_ptr<wire::KeyValue::Stub> kv;
     };
     explicit Impl(ClientOptions requested) : options(std::move(requested)) {
-        if (options.members.size() != 3 || options.timeout.count() <= 0 ||
+        if (!raft::ValidMemberCount(options.members.size()) || options.timeout.count() <= 0 ||
             options.timeout > std::chrono::seconds{30} || options.rpc_timeout.count() <= 0 ||
             options.rpc_timeout > std::chrono::seconds{30}) { throw std::invalid_argument("Invalid client members or timeout"); }
         std::set<raft::NodeId> ids; std::set<std::string> addresses;
