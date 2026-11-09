@@ -44,6 +44,28 @@ ReplicaCheckpoint DecodeReplicaCheckpoint(std::string_view bytes, const raft::No
     return result;
 }
 
+std::string EncodeSnapshotMeta(const SnapshotMeta& meta) {
+    std::string bytes("KVS1");
+    AppendU64(bytes, meta.info.index);
+    AppendU64(bytes, meta.info.term);
+    AppendU32(bytes, meta.info.fingerprint);
+    AppendU32(bytes, meta.file_count);
+    AppendU32(bytes, Crc32(bytes));
+    return bytes;
+}
+
+SnapshotMeta DecodeSnapshotMeta(std::string_view bytes) {
+    if (bytes.size() != kSnapshotMetaBytes || bytes.substr(0, 4) != "KVS1" ||
+        ReadU32(bytes, kSnapshotMetaBytes - 4) != Crc32(bytes.substr(0, kSnapshotMetaBytes - 4))) {
+        throw std::runtime_error("Invalid snapshot metadata or checksum");
+    }
+    SnapshotMeta meta{{ReadU64(bytes, 4), ReadU64(bytes, 12), ReadU32(bytes, 20)}, ReadU32(bytes, 24)};
+    if (meta.info.index == 0 || meta.info.term == 0 || meta.file_count > kMaxSnapshotFiles) {
+        throw std::runtime_error("Snapshot metadata is out of range");
+    }
+    return meta;
+}
+
 std::uint32_t ExtendReplicaFingerprint(std::uint32_t previous, const raft::LogEntry& entry) {
     std::string bytes;
     AppendU32(bytes, previous);

@@ -59,6 +59,12 @@ public:
     // Wait for flushes queued before this call, then capture and wait for compaction requests.
     // This includes automatic compaction scheduled by those flushes; failures propagate.
     void WaitForBackgroundWork();
+    // Flush all pending data, then hard-link the live SSTables (oldest first) into an existing
+    // directory on this filesystem. The caller must exclude writers so the view has one log position.
+    std::vector<std::string> CreateCheckpoint(const std::string& directory);
+    static std::string CheckpointFileName(std::size_t ordinal);
+    // Atomically replace a closed Store's contents with these SSTables, oldest first.
+    static void ResetToSnapshot(const std::string& wal_path, const std::vector<std::string>& sstables);
     std::size_t sstable_count() const;
     // Encoded entry sizes in the active/frozen tables; not allocator or map-node memory.
     std::size_t memtable_bytes() const;

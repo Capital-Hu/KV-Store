@@ -16,7 +16,7 @@ target_compile_features(kvstore_file_io PUBLIC cxx_std_17)
 
 add_library(kvstore_engine STATIC src/engine/memtable.cpp src/engine/wal_record.cpp
     src/engine/store.cpp src/engine/sstable.cpp src/engine/manifest.cpp src/engine/compaction.cpp
-    src/engine/background_compaction.cpp src/engine/background_flush.cpp
+    src/engine/background_compaction.cpp src/engine/background_flush.cpp src/engine/checkpoint.cpp
     src/engine/bloom_filter.cpp src/engine/block_cache.cpp)
 target_include_directories(kvstore_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(kvstore_engine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

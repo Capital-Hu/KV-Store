@@ -22,6 +22,7 @@ struct ServerOptions {
     std::chrono::milliseconds tick_interval{10};
     std::chrono::milliseconds rpc_timeout{150};
     std::chrono::milliseconds client_wait_timeout{1000};
+    std::chrono::milliseconds snapshot_transfer_timeout{120000};
 };
 
 // Local, trusted static odd-sized transport. Internally serializes all Replica calls.

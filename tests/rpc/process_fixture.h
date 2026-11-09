@@ -35,6 +35,7 @@ namespace rpc = kvstore::rpc;
 namespace raft = kvstore::raft;
 using namespace std::chrono_literals;
 std::string node_binary, admin_binary;
+std::vector<std::string> extra_node_arguments;
 
 std::shared_ptr<grpc::Channel> LocalChannel(const std::string& address) {
     grpc::ChannelArguments arguments; arguments.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
@@ -146,6 +147,7 @@ public:
     void Start(int node, const std::string& mode) {
         std::vector<std::string> arguments{node_binary, "--id", std::to_string(node + 1), "--directory", directory.Path("node" + std::to_string(node + 1)),
                                            "--mode", mode, "--members", members};
+        arguments.insert(arguments.end(), extra_node_arguments.begin(), extra_node_arguments.end());
         if (!raft_routes.empty()) { arguments.insert(arguments.end(), {"--raft-routes", raft_routes}); }
         children[node].Start(std::move(arguments), directory.Path("node" + std::to_string(node + 1) + ".log"));
     }

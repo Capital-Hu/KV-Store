@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
                 std::cout << "id=" << response.id() << " role=" << kvstore::wire::Role_Name(response.role())
                           << " term=" << response.term() << " leader=" << response.leader_id()
                           << " log=" << response.last_log_index() << " commit=" << response.commit_index()
-                          << " applied=" << response.last_applied() << '\n';
+                          << " applied=" << response.last_applied() << " base=" << response.log_base_index() << '\n';
             }
         } else if ((operation == "propose-put" && argc == 5) || (operation == "propose-delete" && argc == 4)) {
             kvstore::wire::Command request; kvstore::wire::Proposal response;

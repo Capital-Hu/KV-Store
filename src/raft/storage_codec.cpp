@@ -62,6 +62,8 @@ void ValidateTermAndVote(const PersistentState& state, const NodeConfig& config,
     }
 }
 
+std::size_t LogEntryBytes(const LogEntry& entry) { return EntryBytes(entry); }
+
 bool SameEntry(const LogEntry& left, const LogEntry& right) {
     return left.index == right.index && left.term == right.term && left.command.type == right.command.type &&
            left.command.key == right.command.key && left.command.value == right.command.value;
@@ -80,13 +82,13 @@ bool ValidCommand(const Command& command) {
 
 std::size_t ValidateSuffix(const PersistentState& state, std::size_t log_bytes,
                            LogIndex first_index, const std::vector<LogEntry>& entries) {
-    if (first_index == 0 || first_index > state.log.size() + 1) {
+    if (first_index <= state.base.index || first_index > state.last_index() + 1) {
         throw std::invalid_argument("Raft suffix must follow an existing log prefix");
     }
-    const auto prefix = static_cast<std::size_t>(first_index - 1);
+    const auto prefix = static_cast<std::size_t>(first_index - state.base.index - 1);
     if (entries.size() > kMaxRaftEntries - prefix) { throw std::length_error("Too many live Raft entries"); }
     for (std::size_t i = prefix; i < state.log.size(); ++i) { log_bytes -= EntryBytes(state.log[i]); }
-    auto previous_term = prefix == 0 ? 0 : state.log[prefix - 1].term;
+    auto previous_term = prefix == 0 ? state.base.term : state.log[prefix - 1].term;
     for (std::size_t i = 0; i < entries.size(); ++i) {
         const auto& entry = entries[i];
         const auto& command = entry.command;
@@ -157,6 +159,10 @@ std::string EncodeChange(const Change& change) {
             bytes += entry.command.key;
             bytes += entry.command.value;
         }
+    } else if (change.type == ChangeType::Base) {
+        coding::AppendU64(bytes, change.base.index);
+        coding::AppendU64(bytes, change.base.term);
+        coding::AppendU32(bytes, change.base.fingerprint);
     } else { throw std::invalid_argument("Unknown Raft change type"); }
     return bytes;
 }
@@ -190,6 +196,10 @@ Change DecodeChange(std::string_view payload) {
             entry.command.value = std::string(input.Take(value_bytes));
             change.entries.push_back(std::move(entry));
         }
+    } else if (change.type == ChangeType::Base) {
+        change.base.index = input.U64();
+        change.base.term = input.U64();
+        change.base.fingerprint = input.U32();
     } else { throw std::runtime_error("Unknown Raft change type"); }
     if (input.remaining() != 0) { throw std::runtime_error("Unexpected Raft payload trailing bytes"); }
     return change;

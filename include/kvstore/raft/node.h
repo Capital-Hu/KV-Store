@@ -38,6 +38,7 @@ struct NodeStatus {
     std::chrono::milliseconds election_elapsed{0};
     std::chrono::milliseconds election_timeout{0};
     std::chrono::milliseconds heartbeat_elapsed{0};
+    LogIndex log_base_index = 0;  // Entries through this index have been truncated.
 };
 
 // Single-threaded protocol model. Its caller will serialize events.
@@ -72,10 +73,29 @@ public:
     // Acknowledge exactly the next entry, only after successful state-machine application.
     void MarkApplied(LogIndex index);
 
+    // Drop applied entries through index from the durable log.
+    void CompactLog(LogIndex index, std::uint32_t fingerprint);
+    std::size_t live_log_bytes() const;
+    // The newest complete state-machine snapshot this node can offer lagging peers.
+    void SetSnapshot(const SnapshotInfo& snapshot) { snapshot_ = snapshot; }
+    // A follower's Step may request a state-machine replacement; its owner must then call
+    // FinishSnapshotInstall, passing true only after the state machine holds that snapshot.
+    std::optional<SnapshotInfo> PendingSnapshotInstall() const;
+    void FinishSnapshotInstall(bool installed);
+
 private:
     struct PendingAppend {
         std::uint64_t rpc_id;
         AppendEntriesRequest request;
+    };
+    struct PendingSnapshot {
+        std::uint64_t rpc_id;
+        InstallSnapshotRequest request;
+    };
+    struct PendingInstall {
+        NodeId from;
+        std::uint64_t rpc_id;
+        SnapshotInfo snapshot;
     };
     struct Peer {
         NodeId id;
@@ -85,6 +105,7 @@ private:
         LogIndex match_index = 0;
         LogIndex acknowledged_commit = 0;
         std::optional<PendingAppend> pending = std::nullopt;
+        std::optional<PendingSnapshot> pending_snapshot = std::nullopt;
     };
     void EnsureUsable() const;
     void Fail();
@@ -95,6 +116,7 @@ private:
     void BecomeLeader();
     void SendHeartbeats();
     void SendAppend(Peer& peer, bool retry = false);
+    void ContinueReplication();
     void AdvanceCommit();
     Proposal AppendProposal(Command command);
     std::uint64_t NextRpcId();
@@ -102,6 +124,8 @@ private:
     void Handle(const Message& message, const RequestVoteResponse& response);
     void Handle(const Message& message, const AppendEntriesRequest& request);
     void Handle(const Message& message, const AppendEntriesResponse& response);
+    void Handle(const Message& message, const InstallSnapshotRequest& request);
+    void Handle(const Message& message, const InstallSnapshotResponse& response);
 
     NodeConfig config_;
     PersistentState initial_;
@@ -120,6 +144,8 @@ private:
     std::vector<Message> outbox_;
     std::uint64_t last_rpc_id_ = 0;
     bool usable_ = true;
+    std::optional<SnapshotInfo> snapshot_;
+    std::optional<PendingInstall> pending_install_;
 };
 
 }  // namespace kvstore::raft

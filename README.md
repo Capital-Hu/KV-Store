@@ -247,9 +247,9 @@ ctest --test-dir build/network -R '^(grpc_.*|client_process|cluster_fault|odd_pr
 
 | Build configuration | CTest groups |
 | --- | --- |
-| Default, gRPC disabled | 20 |
-| gRPC enabled | 25 |
-| gRPC and benchmarks enabled | 27 |
+| Default, gRPC disabled | 21 |
+| gRPC enabled | 27 |
+| gRPC and benchmarks enabled | 29 |
 
 Coverage includes record corruption and truncation, WAL replay, manifest publication, tombstones, background-task interleavings, indexes and caching, Raft elections and conflict resolution, committed application, and process crashes. Network tests cover real KV replication, leader termination and re-election, node restart and catch-up, invalid RPCs, concurrent administration calls, and shutdown. Client tests additionally cover commit acknowledgements, quorum loss, read barriers, safe redirection, lost replies after real commits, and uncertain CLI outcomes. The seven cluster fault scenarios additionally cover live-leader isolation, follower isolation, one-way loss, complete partition, two mixed message schedules, combined crash/restart, and route validation. Tests create their own temporary data; network tests require permission to bind loopback ports and spawn child processes.
 
@@ -326,7 +326,7 @@ The root `CMakeLists.txt` defines the core libraries, applications, and demos. E
 
 - The network runtime supports a positive odd number of static members on `127.0.0.1`, using plaintext gRPC without authentication. Membership changes while a cluster is running are not implemented.
 - The client implements consistent reads and commit-confirmed writes. Reads append NoOps; there is no request deduplication, automatic replay of uncertain writes, or exactly-once guarantee.
-- Transactions, MVCC, snapshots, Raft log truncation, and leveled compaction are not implemented. Store compaction reclaims SSTables; it does not compact the Raft log. The live Raft log is limited to 64 MiB and 1,000,000 entries, including read barriers.
+- Transactions, MVCC, and leveled compaction are not implemented. Store compaction reclaims SSTables; [snapshots and log truncation](docs/steps/21-snapshot.md) keep the Raft log bounded, by default every 100,000 entries or 32 MiB, and lagging followers catch up through `InstallSnapshot`. The untruncated log is still limited to 64 MiB and 1,000,000 entries.
 - SSTable Bloom filters and block indexes are rebuilt in memory when tables open. Foreground Store operations currently share a coarse mutex, and writes synchronize the WAL individually.
 - A finite local fault matrix covers partitions, one-way loss, delayed/duplicated/reordered envelopes, crash recovery, and convergence. It is not an exhaustive history checker or a simulation of every TCP failure. Benchmarks record finite local mixed workloads; large datasets, cold caches, long-running compaction, and fixed-arrival-rate capacity remain unmeasured.
 

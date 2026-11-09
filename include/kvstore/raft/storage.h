@@ -41,6 +41,11 @@ public:
     // Keep [1, first_index), replace the ENTIRE suffix with entries (possibly empty).
     // The protocol layer must also protect its committed prefix.
     void ReplaceSuffix(LogIndex first_index, const std::vector<LogEntry>& entries);
+    // Atomically rewrite the journal without entries through index, which becomes the new base.
+    void CompactPrefix(LogIndex index, std::uint32_t fingerprint);
+    // Atomically discard the whole log and restart it after snapshot.
+    void ResetToSnapshot(const SnapshotInfo& snapshot);
+    std::size_t log_bytes() const { return log_bytes_; }
 
 private:
     friend struct StorageTestAccess;
@@ -49,6 +54,7 @@ private:
     void EnsureUsable() const;
     void AppendFrame(std::string_view frame);
     void Load(StorageRecoveryMode recovery);
+    void RewriteJournal(const SnapshotInfo& base, std::size_t first_kept);
 
     std::string path_;
     NodeConfig config_;

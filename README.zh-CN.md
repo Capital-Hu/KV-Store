@@ -247,9 +247,9 @@ ctest --test-dir build/network -R '^(grpc_.*|client_process|cluster_fault|odd_pr
 
 | 构建配置 | CTest 组数 |
 | --- | --- |
-| 默认构建，关闭 gRPC | 20 |
-| 启用 gRPC | 25 |
-| 同时启用 gRPC 与 benchmark | 27 |
+| 默认构建，关闭 gRPC | 21 |
+| 启用 gRPC | 27 |
+| 同时启用 gRPC 与 benchmark | 29 |
 
 覆盖记录损坏与截断、WAL 回放、manifest 发布、删除标记、后台任务交错、索引和缓存、Raft 选举与冲突修正、提交执行及进程崩溃。网络测试覆盖真实 KV 复制、Leader 被终止后重选、节点重启追赶、非法 RPC、并发管理调用及关闭。客户端测试还覆盖提交确认、失去多数派、读屏障、安全重定向、实际提交后的回复丢失及 CLI 未知结果。七类集群故障场景进一步覆盖存活 Leader 隔离、Follower 隔离、单向丢失、完全分区、两种混合消息序列、崩溃／重启组合及路由校验。测试使用独立临时数据；网络测试需要允许绑定回环端口和启动子进程。
 
@@ -281,7 +281,7 @@ python3 scripts/benchmark.py --build-dir build/release
 python3 scripts/benchmark.py --build-dir build/release --nodes 5 --profile mixed --threads 4 --repetitions 1 --operations 200
 ```
 
-命令最后打印 `build/benchmark-results/` 下的报告位置。报告保留每轮结果、逐条延迟、结果计数、各操作统计、构建与机器信息，以及节点日志和数据；不会覆盖已有输出目录。启用 benchmark 的测试构建包含 `benchmark_workload` 和 `benchmark_smoke`，共 27 组 CTest，其中流程验证会分别运行 1、3、5 节点。
+命令最后打印 `build/benchmark-results/` 下的报告位置。报告保留每轮结果、逐条延迟、结果计数、各操作统计、构建与机器信息，以及节点日志和数据；不会覆盖已有输出目录。启用 benchmark 的测试构建包含 `benchmark_workload` 和 `benchmark_smoke`，共 29 组 CTest，其中流程验证会分别运行 1、3、5 节点。
 
 运行该构建的完整测试：
 
@@ -326,12 +326,13 @@ docs/               架构说明和逐步实现讲解，使用中文
 
 - 网络运行层支持正奇数个静态成员，仅接受 `127.0.0.1` 地址，使用无认证的明文 gRPC；不提供运行中成员变更。
 - 客户端已提供一致性读取和提交确认。每次读取追加 NoOp；暂不提供请求去重、不确定写入的自动重放或 exactly-once 保证。
-- 暂无事务、MVCC、快照、Raft 日志截断及分层合并。Store 的 compaction 回收 SSTable，不负责压缩 Raft 日志。逻辑 Raft 日志上限为 64 MiB、1,000,000 条，包含读取产生的屏障。
+- 暂无事务、MVCC 及分层合并。Store 的 compaction 回收 SSTable；Raft 日志由[快照与截断](docs/steps/21-snapshot.md)保持有界，默认每 10 万条或 32 MiB 生成一次快照，落后节点通过 `InstallSnapshot` 追赶。未截断的日志上限仍为 64 MiB、1,000,000 条。
 - SSTable 的 Bloom 过滤器和块索引在打开文件时重建到内存。Store 的前台操作目前共用一把较大粒度的锁，每条写入单独同步 WAL。
 - 本机有限故障矩阵覆盖分区、单向丢失、消息延迟／重复／乱序、崩溃恢复和数据收敛；它不是穷尽所有历史的检查器，也不模拟 TCP 的每一种故障。benchmark 记录本机有限混合负载；大数据集、冷缓存、长期合并和固定到达速率下的容量尚未测量。
 
 ## 延伸阅读
 
+- [Raft 快照与日志截断](docs/steps/21-snapshot.md)：生成时机、安装协议与崩溃恢复。
 - [奇数规模成员配置](docs/steps/20-odd-membership.md)：启动配置、多数派计算、旧格式兼容与恢复验证。
 - [最终架构回顾与验收](docs/final-review.md)：串联读写、恢复、锁、提交规则和已完成范围。
 - [Benchmark 测量方法](docs/steps/19-benchmark.md)与[本机结果](docs/benchmarks/step19-local.md)：负载、计时、逐条样本与解释范围。

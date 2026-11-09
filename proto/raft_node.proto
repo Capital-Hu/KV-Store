@@ -41,6 +41,27 @@ message AppendResponse {
   uint64 term = 1;
   bool success = 2;
 }
+message SnapshotRequest {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 index = 3;
+  uint64 snapshot_term = 4;
+  uint32 fingerprint = 5;
+}
+message SnapshotResponse {
+  uint64 term = 1;
+  bool success = 2;
+}
+// Every chunk repeats the snapshot identity; files are sent in ordinal order.
+message SnapshotChunk {
+  uint64 index = 1;
+  uint64 term = 2;
+  uint32 fingerprint = 3;
+  uint32 file_count = 4;
+  uint32 file_ordinal = 5;
+  bytes data = 6;
+  bool file_end = 7;
+}
 message Envelope {
   uint64 from = 1;
   uint64 to = 2;
@@ -50,12 +71,15 @@ message Envelope {
     VoteResponse vote_response = 5;
     AppendRequest append_request = 6;
     AppendResponse append_response = 7;
+    SnapshotRequest snapshot_request = 8;
+    SnapshotResponse snapshot_response = 9;
   }
 }
 
 // Empty acknowledges transport delivery; Raft responses travel as separate envelopes.
 service RaftTransport {
   rpc Deliver(Envelope) returns (Empty);
+  rpc PushSnapshot(stream SnapshotChunk) returns (Empty);
 }
 
 enum Role {
@@ -72,6 +96,7 @@ message NodeStatus {
   uint64 last_log_index = 5;
   uint64 commit_index = 6;
   uint64 last_applied = 7;
+  uint64 log_base_index = 8;
 }
 message Proposal {
   uint64 index = 1;

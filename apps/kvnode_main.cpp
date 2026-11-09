@@ -11,7 +11,7 @@ namespace {
 static_assert(std::atomic<bool>::is_always_lock_free, "Signal flag must not acquire a hidden lock");
 std::atomic<bool> stop_requested{false};
 extern "C" void StopSignal(int) { stop_requested.store(true, std::memory_order_relaxed); }
-constexpr auto kUsage = "kvnode --id ID --directory PATH --mode new|existing --members MEMBERS [--raft-routes MEMBERS]";
+constexpr auto kUsage = "kvnode --id ID --directory PATH --mode new|existing --members MEMBERS [--raft-routes MEMBERS] [--snapshot-entries N] [--snapshot-retain N]";
 }
 
 int main(int argc, char** argv) {
@@ -26,6 +26,8 @@ int main(int argc, char** argv) {
             else if (argument == "--directory") { options.directory = value; }
             else if (argument == "--members") { options.members = kvstore::rpc::ParseMembers(value); }
             else if (argument == "--raft-routes") { options.raft_routes = kvstore::rpc::ParseMembers(value); }
+            else if (argument == "--snapshot-entries") { options.replica.snapshot_threshold_entries = kvstore::rpc::ParseUnsigned(value); }
+            else if (argument == "--snapshot-retain") { options.replica.snapshot_retain_entries = kvstore::rpc::ParseUnsigned(value); }
             else if (argument == "--mode") {
                 if (value == "new") { options.mode = kvstore::raft::StorageOpenMode::CreateNew; }
                 else if (value == "existing") { options.mode = kvstore::raft::StorageOpenMode::OpenExisting; }

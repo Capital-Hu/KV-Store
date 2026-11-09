@@ -18,10 +18,13 @@ Node::Node(NodeConfig config, std::unique_ptr<Storage> storage, ElectionOptions 
         options_.election_timeout_max < options_.election_timeout_min) {
         throw std::invalid_argument("Election timeout must exceed a positive heartbeat interval");
     }
-    if ((!storage_ && recovered_commit != 0) || (storage_ && recovered_commit > storage_->state().log.size())) {
+    if ((!storage_ && recovered_commit != 0) ||
+        (storage_ && (recovered_commit > storage_->state().last_index() || recovered_commit < storage_->state().base.index))) {
         throw std::invalid_argument("Recovered commit must be within the durable Raft log");
     }
     commit_index_ = recovered_commit;
+    // Truncated entries are already part of the durable state machine.
+    if (storage_) { last_applied_ = storage_->state().base.index; }
     if (storage_) {
         auto peers = config_.peers, stored_peers = storage_->config().peers;
         std::sort(peers.begin(), peers.end()); std::sort(stored_peers.begin(), stored_peers.end());
@@ -65,9 +68,9 @@ void Node::Fail() { usable_ = false; outbox_.clear(); }
 NodeStatus Node::status() const {
     const auto& state = persistent_state();
     return {config_.id, role_, state.current_term, leader_id_,
-            state.log.empty() ? 0 : state.log.back().index,
-            state.log.empty() ? 0 : state.log.back().term,
-            commit_index_, last_applied_, logical_time_, election_elapsed_, election_timeout_, heartbeat_elapsed_};
+            state.last_index(), state.TermAt(state.last_index()),
+            commit_index_, last_applied_, logical_time_, election_elapsed_, election_timeout_, heartbeat_elapsed_,
+            state.base.index};
 }
 
 void Node::AdvanceTime(std::chrono::milliseconds elapsed) {
@@ -122,7 +125,7 @@ void Node::ClearElection() {
     outbox_.clear();
     for (auto& peer : peers_) {
         peer.vote_rpc_id = 0; peer.vote_granted = false;
-        peer.pending.reset(); peer.next_index = 1; peer.match_index = 0; peer.acknowledged_commit = 0;
+        peer.pending.reset(); peer.pending_snapshot.reset(); peer.next_index = 1; peer.match_index = 0; peer.acknowledged_commit = 0;
     }
 }
 
@@ -169,7 +172,9 @@ void Node::BecomeLeader() {
     const auto next = status().last_log_index + 1;
     for (auto& peer : peers_) { peer.next_index = next; }
     // A current-term entry lets the new leader establish the committed prefix.
-    storage_->Append({{next, status().term, {CommandType::NoOp, {}, {}}}});
+    // A full log must not kill the winner: without the NoOp it can still replicate and serve truncation.
+    try { storage_->Append({{next, status().term, {CommandType::NoOp, {}, {}}}}); }
+    catch (const std::length_error&) { if (!storage_->usable()) { throw; } }
     AdvanceCommit();
     SendHeartbeats();
 }

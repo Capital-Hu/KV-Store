@@ -2,6 +2,7 @@
 #include "kvstore/raft/node.h"
 #include "kvstore/raft/storage.h"
 
+#include <limits>
 #include <stdexcept>
 #include <type_traits>
 
@@ -51,8 +52,13 @@ wire::Envelope EncodeMessage(const raft::Message& message) {
                 auto* target = out->add_entries(); target->set_index(entry.index); target->set_term(entry.term);
                 EncodeCommand(entry.command, target->mutable_command());
             }
-        } else {
+        } else if constexpr (std::is_same_v<Body, raft::AppendEntriesResponse>) {
             auto* out = result.mutable_append_response(); out->set_term(body.term); out->set_success(body.success);
+        } else if constexpr (std::is_same_v<Body, raft::InstallSnapshotRequest>) {
+            auto* out = result.mutable_snapshot_request(); out->set_term(body.term); out->set_leader_id(body.leader_id);
+            out->set_index(body.snapshot.index); out->set_snapshot_term(body.snapshot.term); out->set_fingerprint(body.snapshot.fingerprint);
+        } else {
+            auto* out = result.mutable_snapshot_response(); out->set_term(body.term); out->set_success(body.success);
         }
     }, message.body);
     return result;
@@ -74,8 +80,7 @@ raft::Message DecodeMessage(const wire::Envelope& message) {
             const auto& body = message.append_request();
             Require(body.term() != 0 && body.leader_id() == message.from() && body.prev_log_term() <= body.term() &&
                     ((body.prev_log_index() == 0) == (body.prev_log_term() == 0)) && body.entries_size() <= 64 &&
-                    body.prev_log_index() <= raft::kMaxRaftEntries &&
-                    static_cast<std::size_t>(body.entries_size()) <= raft::kMaxRaftEntries - body.prev_log_index());
+                    body.prev_log_index() <= std::numeric_limits<std::uint64_t>::max() - raft::kMaxRaftEntries);
             raft::AppendEntriesRequest request{body.term(), body.leader_id(), body.prev_log_index(), body.prev_log_term(), {}, body.leader_commit()};
             auto term = body.prev_log_term(); std::size_t bytes = 13;
             for (const auto& source : body.entries()) {
@@ -89,6 +94,14 @@ raft::Message DecodeMessage(const wire::Envelope& message) {
         }
         case wire::Envelope::kAppendResponse:
             result.body = raft::AppendEntriesResponse{message.append_response().term(), message.append_response().success()}; break;
+        case wire::Envelope::kSnapshotRequest: {
+            const auto& body = message.snapshot_request();
+            Require(body.term() != 0 && body.leader_id() == message.from() && body.index() != 0 &&
+                    body.snapshot_term() != 0 && body.snapshot_term() <= body.term());
+            result.body = raft::InstallSnapshotRequest{body.term(), body.leader_id(), {body.index(), body.snapshot_term(), body.fingerprint()}}; break;
+        }
+        case wire::Envelope::kSnapshotResponse:
+            result.body = raft::InstallSnapshotResponse{message.snapshot_response().term(), message.snapshot_response().success()}; break;
         default: throw std::invalid_argument("Missing Raft message body");
     }
     return result;
@@ -98,5 +111,6 @@ void EncodeStatus(const raft::NodeStatus& status, wire::NodeStatus* result) {
     result->set_id(status.id); result->set_term(status.term); result->set_leader_id(status.leader_id.value_or(0));
     result->set_role(status.role == raft::Role::Leader ? wire::LEADER : status.role == raft::Role::Candidate ? wire::CANDIDATE : wire::FOLLOWER);
     result->set_last_log_index(status.last_log_index); result->set_commit_index(status.commit_index); result->set_last_applied(status.last_applied);
+    result->set_log_base_index(status.log_base_index);
 }
 }  // namespace kvstore::rpc

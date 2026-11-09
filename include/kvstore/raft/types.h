@@ -37,12 +37,27 @@ struct LogEntry {
     Command command;
 };
 
+// Identifies a committed prefix: its last index, that entry's term and the
+// coordinator's opaque checksum of the prefix. Index 0 denotes the empty prefix.
+struct SnapshotInfo {
+    LogIndex index = 0;
+    Term term = 0;
+    std::uint32_t fingerprint = 0;
+};
+
 // These fields will require durable storage before the relevant RPC replies.
 // Storage persists these independently of the KV engine's WAL.
+// log holds only entries after base, so log[0] has index base.index + 1.
 struct PersistentState {
     Term current_term = 0;
     std::optional<NodeId> voted_for;
     std::vector<LogEntry> log;
+    SnapshotInfo base;
+
+    LogIndex last_index() const { return base.index + log.size(); }
+    const LogEntry& EntryAt(LogIndex index) const { return log[static_cast<std::size_t>(index - base.index - 1)]; }
+    // Valid for base.index through last_index().
+    Term TermAt(LogIndex index) const { return index == base.index ? base.term : EntryAt(index).term; }
 };
 
 // In-memory RPC values; the network encoding is a later step.
@@ -72,8 +87,21 @@ struct AppendEntriesResponse {
     bool success = false;
 };
 
+// State-machine files travel separately; this message asks the follower to adopt them.
+struct InstallSnapshotRequest {
+    Term term = 0;
+    NodeId leader_id = 0;
+    SnapshotInfo snapshot;
+};
+
+struct InstallSnapshotResponse {
+    Term term = 0;
+    bool success = false;
+};
+
 using MessageBody = std::variant<RequestVoteRequest, RequestVoteResponse,
-                                 AppendEntriesRequest, AppendEntriesResponse>;
+                                 AppendEntriesRequest, AppendEntriesResponse,
+                                 InstallSnapshotRequest, InstallSnapshotResponse>;
 
 // Responses echo the request's rpc_id; transport supplies trusted peer identity.
 struct Message {

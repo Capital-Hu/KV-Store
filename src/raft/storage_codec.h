@@ -9,7 +9,7 @@ namespace kvstore::raft::detail {
 constexpr std::size_t kFrameHeaderBytes = 12;
 constexpr std::size_t kFrameTrailerBytes = 4;
 
-enum class ChangeType { TermAndVote = 1, Suffix = 2 };
+enum class ChangeType { TermAndVote = 1, Suffix = 2, Base = 3 };
 
 struct Change {
     ChangeType type = ChangeType::TermAndVote;
@@ -17,6 +17,7 @@ struct Change {
     std::optional<NodeId> voted_for;
     LogIndex first_index = 0;
     std::vector<LogEntry> entries;
+    SnapshotInfo base;
 };
 
 void ValidateConfig(const NodeConfig& config);
@@ -26,6 +27,7 @@ void ValidateTermAndVote(const PersistentState& state, const NodeConfig& config,
 std::size_t ValidateSuffix(const PersistentState& state, std::size_t log_bytes,
                            LogIndex first_index, const std::vector<LogEntry>& entries);
 bool SameEntry(const LogEntry& left, const LogEntry& right);
+std::size_t LogEntryBytes(const LogEntry& entry);
 
 std::string EncodeFileHeader(const NodeConfig& config);
 std::size_t FileHeaderBytes(const NodeConfig& config);

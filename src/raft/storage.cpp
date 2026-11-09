@@ -34,7 +34,7 @@ std::string ReadUpTo(int fd, std::size_t size) {
 }
 
 void ReserveSuffix(PersistentState& state, LogIndex first_index, std::size_t count) {
-    const auto needed = static_cast<std::size_t>(first_index - 1) + count;
+    const auto needed = static_cast<std::size_t>(first_index - state.base.index - 1) + count;
     if (needed <= state.log.capacity()) { return; }
     const auto capacity = state.log.capacity();
     const auto grown = capacity > kMaxRaftEntries / 2 ? kMaxRaftEntries : std::max(std::size_t{1}, capacity * 2);
@@ -44,9 +44,12 @@ void ReserveSuffix(PersistentState& state, LogIndex first_index, std::size_t cou
 void InstallSuffix(PersistentState& state, LogIndex first_index, std::vector<LogEntry>& entries) {
     static_assert(std::is_nothrow_move_constructible_v<LogEntry>);
     // The caller reserves space before touching durable state; these moves cannot allocate.
-    state.log.resize(static_cast<std::size_t>(first_index - 1));
+    state.log.resize(static_cast<std::size_t>(first_index - state.base.index - 1));
     for (auto& entry : entries) { state.log.push_back(std::move(entry)); }
 }
+
+// Rewrites use several records so a retained suffix never exceeds the frame limit.
+constexpr std::size_t kRewriteBatchBytes = 8 * 1024 * 1024;
 }  // namespace
 
 Storage::Storage(const std::string& path, NodeConfig config, StorageOpenMode mode, StorageRecoveryMode recovery)
@@ -73,6 +76,8 @@ Storage::Storage(const std::string& path, NodeConfig config, StorageOpenMode mod
             io::SyncParentDirectory(path_);
             fd_ = temporary.Release();
         } else {
+            // An interrupted rewrite was never published; the journal at path_ is still authoritative.
+            io::RemoveFile(path_ + ".tmp");
             fd_ = io::OpenRegular(path_, O_RDWR | O_APPEND);
             Load(recovery);
             // Complete records left by an unacknowledged write must be durable before reuse.
@@ -123,13 +128,13 @@ void Storage::SetTermAndVote(Term term, std::optional<NodeId> voted_for) {
 
 void Storage::Append(const std::vector<LogEntry>& entries) {
     EnsureUsable();
-    ReplaceSuffix(state_.log.size() + 1, entries);
+    ReplaceSuffix(state_.last_index() + 1, entries);
 }
 
 void Storage::ReplaceSuffix(LogIndex first_index, const std::vector<LogEntry>& entries) {
     EnsureUsable();
     const auto bytes = detail::ValidateSuffix(state_, log_bytes_, first_index, entries);
-    const auto prefix = static_cast<std::size_t>(first_index - 1);
+    const auto prefix = static_cast<std::size_t>(first_index - state_.base.index - 1);
     if (entries.size() == state_.log.size() - prefix &&
         std::equal(entries.begin(), entries.end(), state_.log.begin() + prefix, detail::SameEntry)) { return; }
     detail::Change change;
@@ -142,6 +147,68 @@ void Storage::ReplaceSuffix(LogIndex first_index, const std::vector<LogEntry>& e
         AppendFrame(frame);
         InstallSuffix(state_, first_index, change.entries);
         log_bytes_ = bytes;
+        Notify(Stage::StateUpdated);
+    } catch (...) { usable_ = false; throw; }
+}
+
+void Storage::CompactPrefix(LogIndex index, std::uint32_t fingerprint) {
+    EnsureUsable();
+    if (index <= state_.base.index || index > state_.last_index()) {
+        throw std::invalid_argument("Raft compaction point must be inside the retained log");
+    }
+    RewriteJournal({index, state_.TermAt(index), fingerprint}, static_cast<std::size_t>(index - state_.base.index));
+}
+
+void Storage::ResetToSnapshot(const SnapshotInfo& snapshot) {
+    EnsureUsable();
+    if (snapshot.index == 0 || snapshot.term == 0 || snapshot.term > state_.current_term) {
+        throw std::invalid_argument("Raft snapshot needs a positive index and a known term");
+    }
+    RewriteJournal(snapshot, state_.log.size());
+}
+
+void Storage::RewriteJournal(const SnapshotInfo& base, std::size_t first_kept) {
+    const auto temporary = path_ + ".tmp";
+    try {
+        io::RemoveFile(temporary);
+        io::OwnedFd file(io::OpenRegular(temporary, O_RDWR | O_APPEND | O_CREAT | O_EXCL));
+        io::WriteAll(file.get(), detail::EncodeFileHeader(config_));
+        if (state_.current_term != 0) {
+            detail::Change vote;
+            vote.term = state_.current_term; vote.voted_for = state_.voted_for;
+            io::WriteAll(file.get(), detail::EncodeFrame(detail::EncodeChange(vote)));
+        }
+        detail::Change marker;
+        marker.type = detail::ChangeType::Base; marker.base = base;
+        io::WriteAll(file.get(), detail::EncodeFrame(detail::EncodeChange(marker)));
+        std::size_t kept_bytes = 0;
+        detail::Change batch;
+        batch.type = detail::ChangeType::Suffix;
+        std::size_t batch_bytes = 0;
+        const auto flush_batch = [&] {
+            if (batch.entries.empty()) { return; }
+            batch.first_index = batch.entries.front().index;
+            io::WriteAll(file.get(), detail::EncodeFrame(detail::EncodeChange(batch)));
+            batch.entries.clear();
+            batch_bytes = 0;
+        };
+        for (std::size_t i = first_kept; i < state_.log.size(); ++i) {
+            const auto size = detail::LogEntryBytes(state_.log[i]);
+            if (batch_bytes + size > kRewriteBatchBytes) { flush_batch(); }
+            batch.entries.push_back(state_.log[i]);
+            batch_bytes += size;
+            kept_bytes += size;
+        }
+        flush_batch();
+        io::SyncFile(file.get());
+        Notify(Stage::RecordSynced);
+        if (::rename(temporary.c_str(), path_.c_str()) == -1) { io::ThrowSystemError("Publish compacted Raft journal"); }
+        io::SyncParentDirectory(path_);
+        ::close(fd_);
+        fd_ = file.Release();
+        state_.log.erase(state_.log.begin(), state_.log.begin() + static_cast<std::ptrdiff_t>(first_kept));
+        state_.base = base;
+        log_bytes_ = kept_bytes;
         Notify(Stage::StateUpdated);
     } catch (...) { usable_ = false; throw; }
 }
@@ -170,6 +237,12 @@ void Storage::Load(StorageRecoveryMode recovery) {
                     detail::ValidateTermAndVote(state_, config_, change.term, change.voted_for);
                     state_.current_term = change.term;
                     state_.voted_for = change.voted_for;
+                } else if (change.type == detail::ChangeType::Base) {
+                    if (state_.base.index != 0 || !state_.log.empty() || change.base.index == 0 ||
+                        change.base.term == 0 || change.base.term > state_.current_term) {
+                        throw std::runtime_error("Invalid Raft snapshot base record");
+                    }
+                    state_.base = change.base;
                 } else {
                     const auto bytes = detail::ValidateSuffix(state_, log_bytes_, change.first_index, change.entries);
                     ReserveSuffix(state_, change.first_index, change.entries.size());

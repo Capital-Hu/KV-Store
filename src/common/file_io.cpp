@@ -104,4 +104,8 @@ void RemoveFile(const std::string& path) {
     if (::unlink(path.c_str()) == -1 && errno != ENOENT) { ThrowSystemError("Remove obsolete store file"); }
 }
 
+void HardLink(const std::string& existing, const std::string& target) {
+    if (::link(existing.c_str(), target.c_str()) == -1) { ThrowSystemError("Link immutable store file"); }
+}
+
 }  // namespace kvstore::detail

@@ -73,7 +73,7 @@ void TestAppendAndVoteMetadataValidation() {
             case 3: body->mutable_entries(0)->set_term(0); break;
             case 4: body->mutable_entries(0)->set_term(3); break;
             case 5: body->mutable_entries(2)->set_term(1); break;
-            case 6: body->set_prev_log_index(raft::kMaxRaftEntries + 1); break;
+            case 6: body->set_prev_log_index(std::numeric_limits<std::uint64_t>::max()); break;
             case 7: body->mutable_entries(0)->clear_command(); break;
         }
         Reject([&] { rpc::DecodeMessage(message); }, "Invalid append shape rejected");

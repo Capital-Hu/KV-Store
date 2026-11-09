@@ -75,7 +75,7 @@ flowchart LR
 
 `data` 是传给 Store 的基础路径，也是初始 WAL。目录中的 `LOCK` 及模块配套锁文件用于独占打开。
 
-启动时先验证节点身份、Raft 状态和 COMMIT 的前缀依据，打开本地 Store，完成已保存提交前缀的重放后才向调用方暴露读取。当前会重放整个保存的前缀，依赖 Put/Delete 的最终状态幂等性；没有 Raft 快照、日志截断或 exactly-once 承诺。
+启动时先验证节点身份、Raft 状态和 COMMIT 的前缀依据，打开本地 Store，完成已保存提交前缀的重放后才向调用方暴露读取。重放范围从 Raft 日志基线之后开始，依赖 Put/Delete 的最终状态幂等性；快照与截断见[第 21 步](steps/21-snapshot.md)，没有 exactly-once 承诺。
 
 三节点的 KVR1/KVC1 格式保持原样；其他正奇数规模使用带 peer_count 与排序成员 ID 的 KVR2/KVC2。成员顺序可变，成员身份和数量不允许通过重开目录直接修改。格式和兼容验证见[第 20 步](steps/20-odd-membership.md#持久化格式与兼容)。
 

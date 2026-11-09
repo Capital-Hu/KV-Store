@@ -11,6 +11,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -301,7 +302,7 @@ void TestMalformedAppendsAreIgnored() {
     value = good; value.entries[0].command.type = raft::CommandType::NoOp; bad.push_back(value);
     value = good; value.entries[0].command.type = raft::CommandType::Delete; bad.push_back(value);
     value = good; value.entries[0].command.value.assign(raft::kMaxRaftCommandBytes + 1, 'x'); bad.push_back(value);
-    value = good; value.prev_log_index = raft::kMaxRaftEntries + 1; bad.push_back(value);
+    value = good; value.prev_log_index = std::numeric_limits<raft::LogIndex>::max(); bad.push_back(value);
     value = good; value.entries = {Entry(1, 9), Entry(2, 8)}; bad.push_back(value);
     for (const auto& request : bad) {
         node->Step({2, 1, 10, request});

@@ -1,5 +1,7 @@
 #include "kvstore/rpc/node_server.h"
 #include "protocol_codec.h"
+#include "common/file_io.h"
+#include "kvstore/sstable.h"
 #include "raft_node.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>
@@ -8,15 +10,21 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <set>
 #include <stdexcept>
 #include <thread>
 
+#include <fcntl.h>
+
 namespace kvstore::rpc {
 namespace {
 constexpr std::size_t kPeerQueueLimit = 16;
+constexpr std::size_t kSnapshotChunkBytes = 1024 * 1024;
+constexpr std::uint32_t kMaxSnapshotFiles = 100000;
 
 raft::NodeConfig Validate(const ServerOptions& options) {
     if (options.id == 0 || !raft::ValidMemberCount(options.members.size()) || options.tick_interval.count() <= 0 ||
@@ -57,6 +65,11 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
         std::condition_variable ready;
         std::deque<wire::Envelope> messages;
         std::thread worker;
+        // Snapshot files stream on their own thread so heartbeats keep flowing meanwhile.
+        std::condition_variable transfer_ready;
+        bool transfer_wanted = false;
+        grpc::ClientContext* active_transfer = nullptr;
+        std::thread transfer;
     };
 
     explicit Impl(ServerOptions requested) : options(std::move(requested)) {
@@ -86,7 +99,10 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
         server = builder.BuildAndStart();
         if (!server || selected_port == 0) { throw std::runtime_error("Cannot listen at " + address); }
         try {
-            for (auto& peer : peers) { peer->worker = std::thread([this, target = peer.get()] { SendLoop(*target); }); }
+            for (auto& peer : peers) {
+                peer->worker = std::thread([this, target = peer.get()] { SendLoop(*target); });
+                peer->transfer = std::thread([this, target = peer.get()] { TransferLoop(*target); });
+            }
             ticker = std::thread([this] { TickLoop(); });
         } catch (...) { Stop(); throw; }
     }
@@ -104,6 +120,8 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
             // Synchronize with the wait predicate to avoid a lost stop notification.
             std::lock_guard<std::mutex> lock(peer->mutex);
             peer->ready.notify_all();
+            peer->transfer_ready.notify_all();
+            if (peer->active_transfer != nullptr) { peer->active_transfer->TryCancel(); }
         }
     }
 
@@ -111,7 +129,10 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
         RequestStop();
         if (server) { server->Shutdown(std::chrono::system_clock::now() + options.rpc_timeout); }
         if (ticker.joinable()) { ticker.join(); }
-        for (auto& peer : peers) { if (peer->worker.joinable()) { peer->worker.join(); } }
+        for (auto& peer : peers) {
+            if (peer->worker.joinable()) { peer->worker.join(); }
+            if (peer->transfer.joinable()) { peer->transfer.join(); }
+        }
         if (server) { server->Wait(); server.reset(); }
     }
 
@@ -146,6 +167,7 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
                     peer.ready.wait(lock, [&] { return stopping.load() || !peer.messages.empty(); });
                     if (stopping.load()) { return; }
                     message = std::move(peer.messages.front()); peer.messages.pop_front();
+                    if (message.has_snapshot_request()) { peer.transfer_wanted = true; peer.transfer_ready.notify_one(); }
                 }
                 grpc::ClientContext context;
                 context.set_deadline(std::chrono::system_clock::now() + options.rpc_timeout);
@@ -154,6 +176,110 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
                 (void)peer.stub->Deliver(&context, message, &acknowledgement);
             }
         } catch (const std::exception& error) { Fail(error.what()); }
+    }
+
+    void TransferLoop(Peer& peer) {
+        try {
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lock(peer.mutex);
+                    peer.transfer_ready.wait(lock, [&] { return stopping.load() || peer.transfer_wanted; });
+                    if (stopping.load()) { return; }
+                    peer.transfer_wanted = false;
+                }
+                std::optional<SnapshotFiles> files;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex);
+                    if (stopping.load()) { return; }
+                    files = replica->LatestSnapshot();
+                }
+                // Like a dropped message, a failed transfer is retried on the next heartbeat.
+                if (files) { (void)Transfer(peer, *files); }
+            }
+        } catch (const std::exception& error) { Fail(error.what()); }
+    }
+
+    bool Transfer(Peer& peer, const SnapshotFiles& files) {
+        grpc::ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + options.snapshot_transfer_timeout);
+        {
+            std::lock_guard<std::mutex> lock(peer.mutex);
+            if (stopping.load()) { return false; }
+            peer.active_transfer = &context;
+        }
+        struct Clear {
+            Peer& peer;
+            ~Clear() { std::lock_guard<std::mutex> lock(peer.mutex); peer.active_transfer = nullptr; }
+        } clear{peer};
+        wire::Empty acknowledgement;
+        auto writer = peer.stub->PushSnapshot(&context, &acknowledgement);
+        wire::SnapshotChunk chunk;
+        chunk.set_index(files.info.index); chunk.set_term(files.info.term);
+        chunk.set_fingerprint(files.info.fingerprint); chunk.set_file_count(static_cast<std::uint32_t>(files.paths.size()));
+        bool open = true;
+        if (files.paths.empty()) { open = writer->Write(chunk); }
+        std::string buffer(kSnapshotChunkBytes, '\0');
+        for (std::size_t ordinal = 0; open && ordinal < files.paths.size(); ++ordinal) {
+            std::ifstream input(files.paths[ordinal], std::ios::binary);
+            if (!input.is_open()) { context.TryCancel(); open = false; break; }  // Superseded by a newer snapshot.
+            chunk.set_file_ordinal(static_cast<std::uint32_t>(ordinal));
+            do {
+                input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                chunk.set_data(buffer.data(), static_cast<std::size_t>(input.gcount()));
+                chunk.set_file_end(input.peek() == std::char_traits<char>::eof());
+                open = writer->Write(chunk);
+            } while (open && !chunk.file_end());
+        }
+        if (open) { writer->WritesDone(); }
+        return writer->Finish().ok();
+    }
+
+    grpc::Status ReceiveSnapshot(grpc::ServerContext* context, grpc::ServerReader<wire::SnapshotChunk>* reader) {
+        namespace fs = std::filesystem;
+        wire::SnapshotChunk chunk;
+        if (!reader->Read(&chunk)) { return {grpc::StatusCode::INVALID_ARGUMENT, "Empty snapshot stream"}; }
+        const raft::SnapshotInfo info{chunk.index(), chunk.term(), chunk.fingerprint()};
+        const auto file_count = chunk.file_count();
+        if (info.index == 0 || info.term == 0 || file_count > kMaxSnapshotFiles) {
+            return {grpc::StatusCode::INVALID_ARGUMENT, "Invalid snapshot identity"};
+        }
+        {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            const auto ready = Ready(context); if (!ready.ok()) { return ready; }
+            if (!replica->ShouldReceiveSnapshot(info)) { return grpc::Status::OK; }
+        }
+        const auto directory = replica->incoming_snapshot_directory();
+        fs::remove_all(directory);
+        fs::create_directory(directory);
+        const auto path = [&](std::uint32_t ordinal) { return directory + "/" + ReplicatedStore::SnapshotFileName(ordinal); };
+        std::uint32_t finished = 0;
+        std::optional<kvstore::detail::OwnedFd> file;
+        do {
+            if (chunk.index() != info.index || chunk.term() != info.term || chunk.fingerprint() != info.fingerprint ||
+                chunk.file_count() != file_count || (file_count != 0 && chunk.file_ordinal() != finished) ||
+                (file_count == 0 && !chunk.data().empty()) || finished > file_count || (finished == file_count && file_count != 0)) {
+                return {grpc::StatusCode::INVALID_ARGUMENT, "Snapshot chunk out of order"};
+            }
+            if (file_count == 0) { continue; }
+            if (!file) { file.emplace(kvstore::detail::OpenRegular(path(finished), O_WRONLY | O_CREAT | O_EXCL)); }
+            kvstore::detail::WriteAll(file->get(), chunk.data());
+            if (chunk.file_end()) { kvstore::detail::SyncFile(file->get()); file.reset(); ++finished; }
+        } while (reader->Read(&chunk));
+        if (finished != file_count || file || context->IsCancelled()) { return {grpc::StatusCode::ABORTED, "Snapshot stream ended early"}; }
+        // Opening a table verifies every record checksum and the key order.
+        for (std::uint32_t i = 0; i < file_count; ++i) { SSTableReader verified(path(i)); }
+        if (file_count != 0) { kvstore::detail::SyncParentDirectory(path(0)); }
+        std::lock_guard<std::mutex> lock(state_mutex);
+        const auto ready = Ready(context); if (!ready.ok()) { return ready; }
+        replica->PublishIncomingSnapshot(info, file_count);
+        return grpc::Status::OK;
+    }
+
+    grpc::Status PushSnapshot(grpc::ServerContext* context, grpc::ServerReader<wire::SnapshotChunk>* reader, wire::Empty*) override {
+        std::unique_lock<std::mutex> single(transfer_mutex, std::try_to_lock);
+        if (!single.owns_lock()) { return {grpc::StatusCode::ABORTED, "Another snapshot transfer is running"}; }
+        try { return ReceiveSnapshot(context, reader); }
+        catch (const std::exception& error) { return {grpc::StatusCode::INTERNAL, error.what()}; }
     }
 
     void TickLoop() {
@@ -308,6 +434,7 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
 
     ServerOptions options;
     std::mutex state_mutex;
+    std::mutex transfer_mutex;
     std::condition_variable progress;
     std::size_t client_waiters = 0;
     std::unique_ptr<ReplicatedStore> replica;

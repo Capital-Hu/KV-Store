@@ -29,5 +29,6 @@ void SyncFile(int fd);
 void SyncFile(const std::string& path);
 void SyncParentDirectory(const std::string& path);
 void RemoveFile(const std::string& path);
+void HardLink(const std::string& existing, const std::string& target);
 
 }  // namespace kvstore::detail
