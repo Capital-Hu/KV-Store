@@ -1,0 +1,5 @@
+build/
+.git/
+.vscode/
+.DS_Store
+docs/

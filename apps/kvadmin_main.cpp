@@ -6,7 +6,7 @@
 #include <stdexcept>
 
 int main(int argc, char** argv) {
-    constexpr auto usage = "kvadmin 127.0.0.1:PORT status | propose-put KEY VALUE | propose-delete KEY | local-get KEY | applied INDEX TERM";
+    constexpr auto usage = "kvadmin HOST:PORT status | propose-put KEY VALUE | propose-delete KEY | local-get KEY | applied INDEX TERM";
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") { std::cout << usage << '\n'; return 0; }
         if (argc < 3) { throw std::invalid_argument(usage); }

@@ -43,6 +43,7 @@ raft::NodeConfig Validate(const ServerOptions& options) {
         if (member.id != options.id) { config.peers.push_back(member.id); }
     }
     if (ids.count(options.id) == 0) { throw std::invalid_argument("This node is absent from the member list"); }
+    if (!options.listen_address.empty()) { ValidateListenAddress(options.listen_address); }
     if (!options.raft_routes.empty()) {
         std::set<raft::NodeId> routed_ids; std::set<std::string> routed_addresses;
         for (const auto& route : options.raft_routes) {
@@ -95,6 +96,7 @@ struct NodeServer::Impl final : wire::RaftTransport::Service, wire::NodeAdmin::S
         builder.RegisterService(static_cast<wire::NodeAdmin::Service*>(this));
         builder.RegisterService(static_cast<wire::KeyValue::Service*>(this));
         int selected_port = 0;
+        if (!options.listen_address.empty()) { address = options.listen_address; }
         builder.AddListeningPort(address, grpc::InsecureServerCredentials(), &selected_port);
         server = builder.BuildAndStart();
         if (!server || selected_port == 0) { throw std::runtime_error("Cannot listen at " + address); }

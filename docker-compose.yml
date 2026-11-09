@@ -1,0 +1,54 @@
+# Three-node cluster on a private network. No port is published on purpose:
+# the gRPC API is plaintext and unauthenticated. Reach it through the client service.
+x-node: &node
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+    args:
+      KVSTORE_BUILD_JOBS: ${KVSTORE_BUILD_JOBS:-4}
+  image: replicated-kv-store:local
+  networks: [kvnet]
+  stop_grace_period: 15s
+  healthcheck:
+    test: ["CMD", "kvadmin", "127.0.0.1:50051", "status"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+
+x-cluster-env: &cluster-env
+  KV_MEMBERS: 1=node1:50051,2=node2:50051,3=node3:50051
+  KV_SNAPSHOT_ENTRIES: ${KV_SNAPSHOT_ENTRIES:-100000}
+  KV_SNAPSHOT_RETAIN: ${KV_SNAPSHOT_RETAIN:-1000}
+
+services:
+  node1:
+    <<: *node
+    hostname: node1
+    environment: { <<: *cluster-env, KV_NODE_ID: "1" }
+    volumes: [node1-data:/data]
+  node2:
+    <<: *node
+    hostname: node2
+    environment: { <<: *cluster-env, KV_NODE_ID: "2" }
+    volumes: [node2-data:/data]
+  node3:
+    <<: *node
+    hostname: node3
+    environment: { <<: *cluster-env, KV_NODE_ID: "3" }
+    volumes: [node3-data:/data]
+  # A long-running shell holding kvclient and kvadmin; it does not join the cluster.
+  client:
+    image: replicated-kv-store:local
+    networks: [kvnet]
+    entrypoint: ["sleep", "infinity"]
+    init: true
+    environment:
+      KV_MEMBERS: 1=node1:50051,2=node2:50051,3=node3:50051
+
+networks:
+  kvnet:
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

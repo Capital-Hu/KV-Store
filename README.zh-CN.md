@@ -225,6 +225,28 @@ mkdir -p build/cluster5
 
 现有三节点目录保留原格式；重新打开要求成员 ID 集合不变，直接改列表不构成在线扩缩容。完整启动方式与兼容规则见[成员配置说明](docs/steps/20-odd-membership.md)。
 
+## Docker 集群
+
+需要 Docker 和 Compose v2，无需本机安装 gRPC。首次构建要在镜像内编译 gRPC，耗时较长，之后只修改项目源码时会复用这一层。
+
+```sh
+docker compose up -d --build --wait node1 node2 node3
+docker compose up -d client
+members='1=node1:50051,2=node2:50051,3=node3:50051'
+docker compose exec client kvclient "$members" put name Alice
+docker compose exec client kvclient "$members" get name
+docker compose exec client kvadmin node1:50051 status
+docker compose down      # 保留数据；加 -v 才删除数据卷
+```
+
+一条命令运行完整故障演示（节点崩溃后靠快照追上、Leader 故障切换、网络分区、全集群重启）。它使用独立的 Compose 项目 `kvstore-demo`，结束时只清理该项目的容器和数据卷：
+
+```sh
+sh scripts/docker-demo.sh
+```
+
+Compose 没有向宿主机发布任何端口，因为 gRPC 是明文、无认证的。容器内通过 `client` 服务访问集群。容器重启时入口脚本根据 `/data/node` 是否存在选择 new 或 existing；**不要在保留其他节点的情况下单独删除某个节点的数据卷**，否则该节点会以全新身份加入，失去投票和日志记录，破坏 Raft 的安全前提。Docker 适合演示和验证 Linux 与真实网络，不适合测量性能或模拟断电。
+
 ## 测试
 
 默认构建完成后，运行不含网络的测试：
@@ -324,7 +346,7 @@ docs/               架构说明和逐步实现讲解，使用中文
 
 ## 当前范围与限制
 
-- 网络运行层支持正奇数个静态成员，仅接受 `127.0.0.1` 地址，使用无认证的明文 gRPC；不提供运行中成员变更。
+- 网络运行层支持正奇数个静态成员，地址可以是主机名或 IPv4，使用无认证的明文 gRPC，只应在私有网络中使用；不提供运行中成员变更。除 Docker 单机网络外，尚未在多台物理机上验证。
 - 客户端已提供一致性读取和提交确认。每次读取追加 NoOp；暂不提供请求去重、不确定写入的自动重放或 exactly-once 保证。
 - 暂无事务、MVCC 及分层合并。Store 的 compaction 回收 SSTable；Raft 日志由[快照与截断](docs/steps/21-snapshot.md)保持有界，默认每 10 万条或 32 MiB 生成一次快照，落后节点通过 `InstallSnapshot` 追赶。未截断的日志上限仍为 64 MiB、1,000,000 条。
 - SSTable 的 Bloom 过滤器和块索引在打开文件时重建到内存。Store 的前台操作目前共用一把较大粒度的锁，每条写入单独同步 WAL。

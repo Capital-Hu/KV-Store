@@ -11,7 +11,7 @@ namespace {
 static_assert(std::atomic<bool>::is_always_lock_free, "Signal flag must not acquire a hidden lock");
 std::atomic<bool> stop_requested{false};
 extern "C" void StopSignal(int) { stop_requested.store(true, std::memory_order_relaxed); }
-constexpr auto kUsage = "kvnode --id ID --directory PATH --mode new|existing --members MEMBERS [--raft-routes MEMBERS] [--snapshot-entries N] [--snapshot-retain N]";
+constexpr auto kUsage = "kvnode --id ID --directory PATH --mode new|existing --members MEMBERS [--listen HOST:PORT] [--raft-routes MEMBERS] [--snapshot-entries N] [--snapshot-retain N]";
 }
 
 int main(int argc, char** argv) {
@@ -26,6 +26,7 @@ int main(int argc, char** argv) {
             else if (argument == "--directory") { options.directory = value; }
             else if (argument == "--members") { options.members = kvstore::rpc::ParseMembers(value); }
             else if (argument == "--raft-routes") { options.raft_routes = kvstore::rpc::ParseMembers(value); }
+            else if (argument == "--listen") { options.listen_address = value; }
             else if (argument == "--snapshot-entries") { options.replica.snapshot_threshold_entries = kvstore::rpc::ParseUnsigned(value); }
             else if (argument == "--snapshot-retain") { options.replica.snapshot_retain_entries = kvstore::rpc::ParseUnsigned(value); }
             else if (argument == "--mode") {
@@ -37,6 +38,10 @@ int main(int argc, char** argv) {
         for (const auto* required : {"--id", "--directory", "--mode", "--members"}) {
             if (seen.count(required) == 0) { throw std::invalid_argument(kUsage); }
         }
+        const auto& bound = options.listen_address;
+        bool loopback = !bound.empty() && kvstore::rpc::IsLoopbackAddress(bound);
+        if (bound.empty()) { for (const auto& member : options.members) { if (member.id == options.id) { loopback = kvstore::rpc::IsLoopbackAddress(member.address); } } }
+        if (!loopback) { std::cerr << "WARNING: serving plaintext, unauthenticated gRPC beyond loopback; keep this port on a private network.\n"; }
         std::signal(SIGINT, StopSignal); std::signal(SIGTERM, StopSignal);
         kvstore::rpc::NodeServer node(options);
         std::cout << "Node " << options.id << " started. Ctrl+C stops it; reopen with --mode existing.\n" << std::flush;

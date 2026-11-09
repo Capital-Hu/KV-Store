@@ -110,7 +110,7 @@ void TestStatusFieldsAndUnknownLeader() {
     status.leader_id = 30; wire::NodeStatus output; rpc::EncodeStatus(status, &output); Check(output.leader_id() == 30, "Known leader retained");
 }
 
-void TestMemberParsingAndLoopbackRestriction() {
+void TestMemberParsingAndAddressValidation() {
     const auto members = rpc::ParseMembers("10=127.0.0.1:5101,20=127.0.0.1:5102,30=127.0.0.1:5103");
     Check(members.size() == 3 && members[1].id == 20, "Member IDs are configurable");
     for (const auto& invalid : {"", "1=127.0.0.1:1,2=127.0.0.1:2", "1=127.0.0.1:1,1=127.0.0.1:2,3=127.0.0.1:3",
@@ -118,9 +118,14 @@ void TestMemberParsingAndLoopbackRestriction() {
          "1=127.0.0.1:1,2=127.0.0.1:2,3=127.0.0.1:3,"}) {
         Reject([&] { rpc::ParseMembers(invalid); }, "Invalid member set rejected");
     }
-    for (const auto& address : {"0.0.0.0:5001", "localhost:5001", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:05001", "127.0.0.1:-1"}) {
-        Reject([&] { rpc::ValidateAddress(address); }, "Invalid or non-loopback address rejected");
+    for (const auto& address : {"0.0.0.0:5001", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:05001", "127.0.0.1:-1",
+                                ":5001", "node1", "-node:5001", "bad host:5001", "[::1]:5001"}) {
+        Reject([&] { rpc::ValidateAddress(address); }, "Invalid address rejected");
     }
+    for (const auto* address : {"node1:5001", "localhost:5001", "10.0.0.2:5001", "kv-node_1.internal:5001"}) { rpc::ValidateAddress(address); }
+    rpc::ValidateListenAddress("0.0.0.0:5001");
+    Reject([&] { rpc::ValidateListenAddress("0.0.0.0:0"); }, "Listen address still needs a valid port");
+    Check(rpc::IsLoopbackAddress("127.0.0.1:5001") && !rpc::IsLoopbackAddress("0.0.0.0:5001") && !rpc::IsLoopbackAddress("node1:5001"), "Loopback detection");
     Reject([&] { rpc::ParseUnsigned("18446744073709551616"); }, "Integer overflow rejected");
 }
 
@@ -140,7 +145,7 @@ int main() {
     try {
         TestAllMessageKindsSurviveWireEncoding(); TestInvalidEnvelopeIdentityAndBody(); TestOperationValidationAndAdminNoOpRejection();
         TestAppendAndVoteMetadataValidation(); TestAppendCountAndByteLimits(); TestStatusFieldsAndUnknownLeader();
-        TestMemberParsingAndLoopbackRestriction(); TestRuntimeOptionsRejectBeforeOpeningFiles();
+        TestMemberParsingAndAddressValidation(); TestRuntimeOptionsRejectBeforeOpeningFiles();
         std::cout << "All 8 gRPC codec/config tests passed.\n";
     } catch (const std::exception& error) { std::cerr << "gRPC codec test failed: " << error.what() << '\n'; return 1; }
 }
